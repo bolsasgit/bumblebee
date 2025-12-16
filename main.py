@@ -2,10 +2,11 @@ import time
 import json
 import threading
 import sqlite3
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 # =========================
@@ -13,17 +14,13 @@ from pydantic import BaseModel
 # =========================
 GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
-CLOB_API = "https://clob.polymarket.com"
 
 DB_NAME = "polymarket.db"
 
-# Estratégia
-T3_THRESHOLD = 0.70
-T2_THRESHOLD = 0.85
+T3_DEFAULT = 0.70
+T2_DEFAULT = 0.85
 
-# Polling
 PRICE_POLL_SECONDS = 5
-MARKET_POLL_SECONDS = 10
 
 # =========================
 # DB
@@ -41,7 +38,7 @@ def init_db():
         market_question TEXT,
         start_ts TEXT,
         end_ts TEXT,
-        mode TEXT,                 -- paper | real
+        mode TEXT,
         wallet_id TEXT,
         had_opportunity INTEGER,
         tier TEXT
@@ -51,13 +48,12 @@ def init_db():
     CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id INTEGER,
-        mode TEXT,                 -- paper | real
-        side TEXT,                 -- YES/NO
+        mode TEXT,
+        side TEXT,
         entry_price REAL,
         exit_price REAL,
         size REAL,
         pnl REAL,
-        tx_id TEXT,
         ts TEXT
     )
     """)
@@ -70,116 +66,51 @@ init_db()
 # STATE
 # =========================
 class BotState:
-    running: bool = False
-    mode: str = "paper"            # paper | real
-    max_sessions: Optional[int] = None  # None = 24/7
-    current_sessions: int = 0
+    running = False
+    mode = "paper"
+    max_sessions: Optional[int] = None
+    current_sessions = 0
     wallet_id: Optional[str] = None
-    status_msg: str = "stopped"
+    status_msg = "stopped"
+    t3 = T3_DEFAULT
+    t2 = T2_DEFAULT
 
 STATE = BotState()
-
 LOCK = threading.Lock()
 
 # =========================
-# HELPERS – POLYMARKET
+# POLYMARKET
 # =========================
-def get_active_btc_15m_market() -> Optional[Dict[str, Any]]:
-    """Descobre o mercado BTC 15min ativo (Gamma API)."""
-    resp = requests.get(
+def get_active_market():
+    r = requests.get(
         f"{GAMMA_API}/markets",
-        params={
-            "active": True,
-            "closed": False,
-            "limit": 50,
-            "order": "endDate",
-            "ascending": True
-        },
+        params={"active": True, "closed": False, "limit": 50},
         timeout=10
     )
-    resp.raise_for_status()
-    markets = resp.json()
-    for m in markets:
+    for m in r.json():
         q = (m.get("question") or "").lower()
         if "btc" in q and "15" in q:
             return m
     return None
 
-def get_yes_no_tokens(market: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    clob_ids = market.get("clobTokenIds")
-    if not clob_ids:
-        return None
-    ids = json.loads(clob_ids)
-    if len(ids) < 2:
-        return None
-    return {"YES": ids[0], "NO": ids[1]}
-
-def get_latest_yes_no_prices() -> Optional[Dict[str, float]]:
-    """Usa Data API / trades para obter os últimos preços YES/NO."""
-    resp = requests.get(
-        f"{DATA_API}/trades",
-        params={"limit": 50},
-        timeout=10
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    last_yes, last_no = None, None
-    for t in data:
-        outcome = (t.get("outcome") or "").upper()
-        price = float(t.get("price"))
-        if outcome == "YES":
-            last_yes = price
-        elif outcome == "NO":
-            last_no = price
-        if last_yes is not None and last_no is not None:
-            return {"YES": last_yes, "NO": last_no}
+def get_prices():
+    r = requests.get(f"{DATA_API}/trades", params={"limit": 50}, timeout=10)
+    y = n = None
+    for t in r.json():
+        if t["outcome"] == "YES":
+            y = float(t["price"])
+        if t["outcome"] == "NO":
+            n = float(t["price"])
+        if y and n:
+            return y, n
     return None
-
-# =========================
-# EXECUTION
-# =========================
-def execute_paper_trade(session_id: int, prices: Dict[str, float], tier: str) -> float:
-    """
-    Paper trade simples:
-    - Compra YES e NO com size = 1
-    - Fecha virtualmente no 'fair' (1.0)
-    """
-    yes = prices["YES"]
-    no = prices["NO"]
-    size = 1.0
-
-    entry_cost = yes + no
-    exit_value = 1.0
-    pnl = exit_value - entry_cost
-
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO trades (session_id, mode, side, entry_price, exit_price, size, pnl, tx_id, ts)
-        VALUES (?, 'paper', 'BOTH', ?, ?, ?, ?, NULL, datetime('now'))
-    """, (session_id, entry_cost, exit_value, size, pnl))
-    conn.commit()
-    conn.close()
-    return pnl
-
-def execute_real_trade_stub(session_id: int, prices: Dict[str, float], tier: str) -> float:
-    """
-    Execução REAL:
-    - Aqui você liga exatamente os métodos do py-clob-client
-    - Mantido como stub seguro (pronto para colar suas chaves)
-    """
-    # >>> INTEGRE AQUI o auth_client / create_order / post_order <<<
-    # Deve retornar o pnl REAL calculado com preços reais e fees.
-    return 0.0
 
 # =========================
 # CORE LOOP
 # =========================
 def bot_loop():
-    global STATE
-    current_condition_id = None
+    current_condition = None
     session_id = None
-    market_question = None
 
     while True:
         with LOCK:
@@ -187,261 +118,149 @@ def bot_loop():
                 time.sleep(1)
                 continue
 
-        # 1) Descobrir mercado ativo
-        try:
-            market = get_active_btc_15m_market()
-        except Exception as e:
-            time.sleep(5)
-            continue
-
+        market = get_active_market()
         if not market:
             time.sleep(5)
             continue
 
-        condition_id = market.get("conditionId")
-        market_question = market.get("question")
+        cid = market["conditionId"]
 
-        # 2) Nova sessão quando o conditionId muda
-        if condition_id != current_condition_id:
-            # Fecha sessão anterior
-            if session_id is not None:
-                conn = db()
-                cur = conn.cursor()
-                cur.execute("""
-                    UPDATE sessions
-                    SET end_ts=datetime('now')
-                    WHERE id=?
-                """, (session_id,))
-                conn.commit()
-                conn.close()
+        if cid != current_condition:
+            if session_id:
+                db().execute(
+                    "UPDATE sessions SET end_ts=datetime('now') WHERE id=?",
+                    (session_id,)
+                )
+                STATE.current_sessions += 1
+                if STATE.max_sessions and STATE.current_sessions >= STATE.max_sessions:
+                    STATE.running = False
+                    STATE.status_msg = "completed"
+                    break
 
-                with LOCK:
-                    STATE.current_sessions += 1
-                    if STATE.max_sessions is not None and STATE.current_sessions >= STATE.max_sessions:
-                        STATE.running = False
-                        STATE.status_msg = "completed"
-                        break
-
-            # Abre nova sessão
-            conn = db()
-            cur = conn.cursor()
+            cur = db().cursor()
             cur.execute("""
-                INSERT INTO sessions (condition_id, market_question, start_ts, mode, wallet_id, had_opportunity, tier)
-                VALUES (?, ?, datetime('now'), ?, ?, 0, NULL)
-            """, (condition_id, market_question, STATE.mode, STATE.wallet_id))
+                INSERT INTO sessions (condition_id, market_question, start_ts, mode, wallet_id, had_opportunity)
+                VALUES (?, ?, datetime('now'), ?, ?, 0)
+            """, (cid, market["question"], STATE.mode, STATE.wallet_id))
             session_id = cur.lastrowid
-            conn.commit()
-            conn.close()
+            cur.connection.commit()
+            current_condition = cid
 
-            current_condition_id = condition_id
-
-        # 3) Monitorar preços dentro da sessão
-        try:
-            prices = get_latest_yes_no_prices()
-        except Exception:
-            prices = None
-
+        prices = get_prices()
         if prices:
-            s = prices["YES"] + prices["NO"]
+            y, n = prices
+            s = y + n
             tier = None
-            if s < T3_THRESHOLD:
+            if s < STATE.t3:
                 tier = "T3"
-            elif s < T2_THRESHOLD:
+            elif s < STATE.t2:
                 tier = "T2"
 
             if tier:
-                conn = db()
-                cur = conn.cursor()
-                cur.execute("""
-                    UPDATE sessions
-                    SET had_opportunity=1, tier=?
-                    WHERE id=?
-                """, (tier, session_id))
-                conn.commit()
-                conn.close()
-
-                # Execução
-                if STATE.mode == "paper":
-                    execute_paper_trade(session_id, prices, tier)
-                else:
-                    execute_real_trade_stub(session_id, prices, tier)
+                pnl = 1.0 - s
+                db().execute(
+                    "INSERT INTO trades VALUES (NULL, ?, ?, 'BOTH', ?, 1.0, 1.0, ?, datetime('now'))",
+                    (session_id, STATE.mode, s, pnl)
+                )
+                db().execute(
+                    "UPDATE sessions SET had_opportunity=1, tier=? WHERE id=?",
+                    (tier, session_id)
+                )
+                db().commit()
 
         time.sleep(PRICE_POLL_SECONDS)
 
 # =========================
 # API
 # =========================
-app = FastAPI(title="BumbleBee Bot")
+app = FastAPI(title="BumbleBee")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-class StartRequest(BaseModel):
-    mode: str                 # paper | real
-    sessions: Optional[int]   # 10 | 50 | 100 | null (24/7)
-    wallet_id: Optional[str] = None
+class StartReq(BaseModel):
+    mode: str
+    sessions: Optional[int]
+    t3: Optional[float]
+    t2: Optional[float]
 
 @app.post("/start")
-def start_bot(req: StartRequest):
+def start(req: StartReq):
     with LOCK:
         STATE.mode = req.mode
         STATE.max_sessions = req.sessions
-        STATE.wallet_id = req.wallet_id
+        STATE.t3 = req.t3 or T3_DEFAULT
+        STATE.t2 = req.t2 or T2_DEFAULT
         STATE.current_sessions = 0
         STATE.running = True
         STATE.status_msg = "running"
-    return {"ok": True, "status": "started", "mode": STATE.mode, "sessions": STATE.max_sessions}
+    return {"ok": True}
 
 @app.post("/stop")
-def stop_bot():
+def stop():
     with LOCK:
         STATE.running = False
         STATE.status_msg = "stopped"
-    return {"ok": True, "status": "stopped"}
+    return {"ok": True}
 
 @app.get("/status")
 def status():
-    with LOCK:
-        return {
-            "running": STATE.running,
-            "mode": STATE.mode,
-            "current_sessions": STATE.current_sessions,
-            "max_sessions": STATE.max_sessions,
-            "wallet_id": STATE.wallet_id,
-            "status_msg": STATE.status_msg
-        }
-
-@app.get("/sessions")
-def list_sessions():
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, condition_id, market_question, start_ts, end_ts, mode, wallet_id, had_opportunity, tier
-        FROM sessions ORDER BY id DESC
-    """)
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-@app.get("/trades")
-def list_trades():
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, session_id, mode, side, entry_price, exit_price, size, pnl, tx_id, ts
-        FROM trades ORDER BY id DESC
-    """)
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    return {
+        "running": STATE.running,
+        "mode": STATE.mode,
+        "session": f"{STATE.current_sessions}/{STATE.max_sessions or '∞'}",
+        "t3": STATE.t3,
+        "t2": STATE.t2,
+        "status": STATE.status_msg
+    }
 
 # =========================
-# START THREAD
+# DASHBOARD
 # =========================
-thread = threading.Thread(target=bot_loop, daemon=True)
-thread.start()
-from fastapi.responses import HTMLResponse
-
-DASHBOARD_HTML = """
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return """
 <!DOCTYPE html>
 <html>
-<head>
-  <title>BumbleBee Dashboard</title>
-  <style>
-    body {
-      background:#0f1220; color:#fff; font-family:Arial; text-align:center;
-    }
-    .box { max-width:600px; margin:auto; padding:20px; }
-    button {
-      padding:12px 18px; margin:6px; font-size:16px; cursor:pointer;
-      border:none; border-radius:6px;
-    }
-    .paper { background:#555; }
-    .paper.active { background:#2ecc71; }
-    .real { background:#555; }
-    .real.active { background:#e74c3c; }
-    .session { background:#444; }
-    .session.active { background:#3498db; }
-    .start { background:#27ae60; }
-    .stop { background:#c0392b; }
-    #visor {
-      margin-top:20px; padding:12px; background:#111;
-      border:1px solid #333; min-height:90px;
-    }
-  </style>
-</head>
-<body>
-  <div class="box">
-    <h2>🐝 BumbleBee Dashboard</h2>
+<body style="background:#0f1220;color:white;font-family:Arial;text-align:center">
+<h2>🐝 BumbleBee</h2>
 
-    <div>
-      <button class="paper" onclick="setMode('paper')">PAPER</button>
-      <button class="real" onclick="setMode('real')">REAL</button>
-    </div>
+T3 <input id=t3 value=0.70 step=0.01>
+T2 <input id=t2 value=0.85 step=0.01><br><br>
 
-    <div>
-      <button class="session" onclick="setSessions(10)">10</button>
-      <button class="session" onclick="setSessions(50)">50</button>
-      <button class="session" onclick="setSessions(100)">100</button>
-      <button class="session" onclick="setSessions(null)">24/7</button>
-    </div>
+<button onclick="m='paper'">PAPER</button>
+<button onclick="m='real'">REAL</button><br><br>
 
-    <div>
-      <button class="start" onclick="startBot()">START</button>
-      <button class="stop" onclick="stopBot()">STOP</button>
-    </div>
+<button onclick="s=10">10</button>
+<button onclick="s=50">50</button>
+<button onclick="s=100">100</button>
+<button onclick="s=null">24/7</button><br><br>
 
-    <div id="visor">Aguardando ação…</div>
-  </div>
+<button onclick="start()">START</button>
+<button onclick="fetch('/stop',{method:'POST'})">STOP</button>
+
+<pre id=v></pre>
 
 <script>
-let mode = "paper";
-let sessions = null;
-
-function setMode(m) {
-  mode = m;
-  document.querySelectorAll('.paper,.real').forEach(b=>b.classList.remove('active'));
-  document.querySelector('.'+m).classList.add('active');
-  visor("Modo selecionado: " + m.toUpperCase());
+let m="paper",s=null;
+function start(){
+fetch('/start',{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({
+mode:m,sessions:s,
+t3:parseFloat(t3.value),
+t2:parseFloat(t2.value)
+})}).then(r=>r.json()).then(d=>v.innerText=JSON.stringify(d,null,2))
 }
-
-function setSessions(s) {
-  sessions = s;
-  document.querySelectorAll('.session').forEach(b=>b.classList.remove('active'));
-  if (s !== null) event.target.classList.add('active');
-  visor("Sessões: " + (s===null ? "24/7" : s));
-}
-
-function startBot() {
-  fetch('/start', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({mode:mode, sessions:sessions})
-  })
-  .then(r=>r.json())
-  .then(d=> visor("START: " + JSON.stringify(d)))
-  .catch(e=> visor("Erro ao iniciar"));
-}
-
-function stopBot() {
-  fetch('/stop', {method:'POST'})
-  .then(r=>r.json())
-  .then(d=> visor("STOP: " + JSON.stringify(d)))
-  .catch(e=> visor("Erro ao parar"));
-}
-
-function visor(msg) {
-  document.getElementById('visor').innerText = msg;
-}
+setInterval(()=>fetch('/status').then(r=>r.json()).then(d=>v.innerText=JSON.stringify(d,null,2)),5000)
 </script>
 </body>
 </html>
 """
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    return DASHBOARD_HTML
+# =========================
+# THREAD
+# =========================
+threading.Thread(target=bot_loop, daemon=True).start()
