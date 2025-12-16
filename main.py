@@ -344,3 +344,104 @@ def list_trades():
 # =========================
 thread = threading.Thread(target=bot_loop, daemon=True)
 thread.start()
+from fastapi.responses import HTMLResponse
+
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>BumbleBee Dashboard</title>
+  <style>
+    body {
+      background:#0f1220; color:#fff; font-family:Arial; text-align:center;
+    }
+    .box { max-width:600px; margin:auto; padding:20px; }
+    button {
+      padding:12px 18px; margin:6px; font-size:16px; cursor:pointer;
+      border:none; border-radius:6px;
+    }
+    .paper { background:#555; }
+    .paper.active { background:#2ecc71; }
+    .real { background:#555; }
+    .real.active { background:#e74c3c; }
+    .session { background:#444; }
+    .session.active { background:#3498db; }
+    .start { background:#27ae60; }
+    .stop { background:#c0392b; }
+    #visor {
+      margin-top:20px; padding:12px; background:#111;
+      border:1px solid #333; min-height:90px;
+    }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2>🐝 BumbleBee Dashboard</h2>
+
+    <div>
+      <button class="paper" onclick="setMode('paper')">PAPER</button>
+      <button class="real" onclick="setMode('real')">REAL</button>
+    </div>
+
+    <div>
+      <button class="session" onclick="setSessions(10)">10</button>
+      <button class="session" onclick="setSessions(50)">50</button>
+      <button class="session" onclick="setSessions(100)">100</button>
+      <button class="session" onclick="setSessions(null)">24/7</button>
+    </div>
+
+    <div>
+      <button class="start" onclick="startBot()">START</button>
+      <button class="stop" onclick="stopBot()">STOP</button>
+    </div>
+
+    <div id="visor">Aguardando ação…</div>
+  </div>
+
+<script>
+let mode = "paper";
+let sessions = null;
+
+function setMode(m) {
+  mode = m;
+  document.querySelectorAll('.paper,.real').forEach(b=>b.classList.remove('active'));
+  document.querySelector('.'+m).classList.add('active');
+  visor("Modo selecionado: " + m.toUpperCase());
+}
+
+function setSessions(s) {
+  sessions = s;
+  document.querySelectorAll('.session').forEach(b=>b.classList.remove('active'));
+  if (s !== null) event.target.classList.add('active');
+  visor("Sessões: " + (s===null ? "24/7" : s));
+}
+
+function startBot() {
+  fetch('/start', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({mode:mode, sessions:sessions})
+  })
+  .then(r=>r.json())
+  .then(d=> visor("START: " + JSON.stringify(d)))
+  .catch(e=> visor("Erro ao iniciar"));
+}
+
+function stopBot() {
+  fetch('/stop', {method:'POST'})
+  .then(r=>r.json())
+  .then(d=> visor("STOP: " + JSON.stringify(d)))
+  .catch(e=> visor("Erro ao parar"));
+}
+
+function visor(msg) {
+  document.getElementById('visor').innerText = msg;
+}
+</script>
+</body>
+</html>
+"""
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return DASHBOARD_HTML
