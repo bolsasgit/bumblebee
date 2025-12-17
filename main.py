@@ -5,6 +5,7 @@ import requests
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 # =========================
@@ -104,7 +105,7 @@ def get_latest_yes_no_prices():
     return None
 
 # =========================
-# BOT LOOP (CORRIGIDO)
+# BOT LOOP
 # =========================
 def bot_loop():
     session_id = None
@@ -163,7 +164,6 @@ def bot_loop():
                     STATE.running = False
                     STATE.status_msg = "completed"
                     break
-
             continue
 
         prices = get_latest_yes_no_prices()
@@ -224,6 +224,82 @@ def status():
         "wallet_id": STATE.wallet_id,
         "status_msg": STATE.status_msg
     }
+
+# =========================
+# DASHBOARD HUMANO
+# =========================
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM sessions")
+    total_sessions = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM sessions WHERE end_ts IS NULL")
+    active_sessions = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM price_snapshots")
+    snapshots = cur.fetchone()[0]
+
+    conn.close()
+
+    bot_status = "RODANDO" if STATE.running else "PARADO"
+    modo = "SIMULACAO" if STATE.mode == "paper" else "REAL"
+
+    html = f"""
+    <html>
+    <head>
+        <title>BUMBLEBEE</title>
+        <style>
+            body {{
+                background-color: #0f0f0f;
+                color: #ffffff;
+                font-family: Arial, sans-serif;
+                padding: 30px;
+            }}
+            .box {{
+                border: 2px solid #ffd700;
+                padding: 20px;
+                margin-bottom: 20px;
+            }}
+            h1, h2 {{
+                color: #ffd700;
+            }}
+            p {{
+                font-size: 20px;
+                margin: 6px 0;
+            }}
+        </style>
+    </head>
+    <body>
+
+        <h1>BUMBLEBEE — PAPER TRADE</h1>
+
+        <div class="box">
+            <h2>STATUS GERAL</h2>
+            <p>BOT: {bot_status}</p>
+            <p>MODO: {modo}</p>
+            <p>SESSOES ATIVAS: {active_sessions}</p>
+            <p>SESSOES CONCLUIDAS: {total_sessions - active_sessions}</p>
+        </div>
+
+        <div class="box">
+            <h2>ATIVIDADE</h2>
+            <p>COLETAS DE PRECO: {snapshots}</p>
+            <p>ROUND EM ANDAMENTO: {"SIM" if STATE.running else "NAO"}</p>
+        </div>
+
+        <div class="box">
+            <h2>AVALIACAO</h2>
+            <p>EDGE: EM ANALISE</p>
+            <p>CONSISTENCIA: AGUARDANDO DADOS</p>
+        </div>
+
+    </body>
+    </html>
+    """
+    return html
 
 # =========================
 # START THREAD
