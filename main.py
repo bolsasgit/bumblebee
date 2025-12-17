@@ -1,12 +1,11 @@
 import time
-import json
 import threading
 import sqlite3
-from typing import Optional, Dict, Any
 import requests
+from datetime import datetime, timezone
+from typing import Optional
 from fastapi import FastAPI
 from pydantic import BaseModel
-from datetime import datetime
 
 # =========================
 # CONFIG
@@ -16,10 +15,8 @@ DATA_API = "https://data-api.polymarket.com"
 
 DB_NAME = "polymarket.db"
 
-T3_THRESHOLD = 0.70
-T2_THRESHOLD = 0.85
-
 PRICE_POLL_SECONDS = 5
+T2_THRESHOLD = 0.85
 
 # =========================
 # DB
@@ -40,61 +37,16 @@ def init_db():
         end_ts TEXT,
         mode TEXT,
         wallet_id TEXT,
-        had_trade INTEGER DEFAULT 0,
-        completed_pair INTEGER DEFAULT 0,
-        partial_exposure INTEGER DEFAULT 0,
-        liquidated INTEGER DEFAULT 0,
-        max_exposure_usd REAL DEFAULT 0,
         final_pnl REAL DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id INTEGER,
-        opened_ts TEXT,
-        closed_ts TEXT,
-        status TEXT,
-        side_opened_first TEXT,
-        time_to_second_leg INTEGER,
-        capital_yes REAL DEFAULT 0,
-        capital_no REAL DEFAULT 0,
-        total_cost REAL DEFAULT 0,
-        expected_payoff REAL DEFAULT 0,
-        pnl REAL DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS legs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        trade_id INTEGER,
-        session_id INTEGER,
-        side TEXT,
-        action TEXT,
-        price REAL,
-        quantity REAL,
-        capital REAL,
-        ts TEXT
     );
 
     CREATE TABLE IF NOT EXISTS price_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id INTEGER,
-        trade_id INTEGER,
         ts TEXT,
         seconds_to_expiry INTEGER,
         price_yes REAL,
         price_no REAL
-    );
-
-    CREATE TABLE IF NOT EXISTS liquidations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        trade_id INTEGER,
-        session_id INTEGER,
-        side_closed TEXT,
-        entry_price REAL,
-        exit_price REAL,
-        time_to_expiry INTEGER,
-        pnl REAL,
-        ts TEXT
     );
     """)
 
@@ -127,6 +79,7 @@ def get_active_btc_15m_market():
         timeout=10
     )
     resp.raise_for_status()
+
     for m in resp.json():
         q = (m.get("question") or "").lower()
         if "btc" in q and "15" in q:
@@ -136,52 +89,25 @@ def get_active_btc_15m_market():
 def get_latest_yes_no_prices():
     resp = requests.get(f"{DATA_API}/trades", params={"limit": 50}, timeout=10)
     resp.raise_for_status()
-    last_yes, last_no = None, None
+
+    yes, no = None, None
     for t in resp.json():
-        o = (t.get("outcome") or "").upper()
-        p = float(t.get("price"))
-        if o == "YES":
-            last_yes = p
-        elif o == "NO":
-            last_no = p
-        if last_yes and last_no:
-            return {"YES": last_yes, "NO": last_no}
+        side = (t.get("outcome") or "").upper()
+        price = float(t.get("price"))
+        if side == "YES":
+            yes = price
+        elif side == "NO":
+            no = price
+        if yes and no:
+            return {"YES": yes, "NO": no}
     return None
 
 # =========================
-# PAPER EXECUTION (inalterado)
-# =========================
-def execute_paper_trade(session_id, prices):
-    entry = prices["YES"] + prices["NO"]
-    pnl = 1.0 - entry
-
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO trades (
-            session_id, opened_ts, status,
-            capital_yes, capital_no,
-            total_cost, expected_payoff, pnl
-        )
-        VALUES (?, ?, 'completed', ?, ?, ?, ?, ?)
-    """, (
-        session_id,
-        datetime.utcnow().isoformat(),
-        prices["YES"], prices["NO"],
-        entry, 1.0, pnl
-    ))
-
-    conn.commit()
-    conn.close()
-
-# =========================
-# CORE LOOP
+# BOT LOOP (CORRIGIDO)
 # =========================
 def bot_loop():
-    current_condition = None
     session_id = None
-    end_ts = None
+    session_end_dt = None
 
     while True:
         with LOCK:
@@ -189,28 +115,14 @@ def bot_loop():
                 time.sleep(1)
                 continue
 
-        market = get_active_btc_15m_market()
-        if not market:
-            time.sleep(5)
-            continue
+        if not session_id:
+            market = get_active_btc_15m_market()
+            if not market:
+                time.sleep(5)
+                continue
 
-        condition_id = market["conditionId"]
-
-        if condition_id != current_condition:
-            if session_id:
-                conn = db()
-                cur = conn.cursor()
-                cur.execute("UPDATE sessions SET end_ts=? WHERE id=?", (
-                    datetime.utcnow().isoformat(), session_id
-                ))
-                conn.commit()
-                conn.close()
-
-                STATE.current_sessions += 1
-                if STATE.max_sessions and STATE.current_sessions >= STATE.max_sessions:
-                    STATE.running = False
-                    STATE.status_msg = "completed"
-                    break
+            end_raw = market.get("endDate")
+            session_end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
 
             conn = db()
             cur = conn.cursor()
@@ -218,7 +130,7 @@ def bot_loop():
                 INSERT INTO sessions (condition_id, market_question, start_ts, mode, wallet_id)
                 VALUES (?, ?, ?, ?, ?)
             """, (
-                condition_id,
+                market["conditionId"],
                 market["question"],
                 datetime.utcnow().isoformat(),
                 STATE.mode,
@@ -228,14 +140,33 @@ def bot_loop():
             conn.commit()
             conn.close()
 
-            current_condition = condition_id
-            end_ts = market["endDate"]
+        now = datetime.now(timezone.utc)
+        seconds_left = int((session_end_dt - now).total_seconds())
+
+        if seconds_left <= 0:
+            conn = db()
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE sessions SET end_ts=? WHERE id=?",
+                (datetime.utcnow().isoformat(), session_id)
+            )
+            conn.commit()
+            conn.close()
+
+            session_id = None
+            session_end_dt = None
+
+            with LOCK:
+                STATE.current_sessions += 1
+                if STATE.max_sessions and STATE.current_sessions >= STATE.max_sessions:
+                    STATE.running = False
+                    STATE.status_msg = "completed"
+                    break
+
+            continue
 
         prices = get_latest_yes_no_prices()
         if prices:
-            now = datetime.utcnow()
-            seconds_left = int((datetime.fromisoformat(end_ts.replace("Z","")) - now).total_seconds())
-
             conn = db()
             cur = conn.cursor()
             cur.execute("""
@@ -244,17 +175,13 @@ def bot_loop():
                 ) VALUES (?, ?, ?, ?, ?)
             """, (
                 session_id,
-                now.isoformat(),
+                datetime.utcnow().isoformat(),
                 seconds_left,
                 prices["YES"],
                 prices["NO"]
             ))
             conn.commit()
             conn.close()
-
-            s = prices["YES"] + prices["NO"]
-            if s < T2_THRESHOLD:
-                execute_paper_trade(session_id, prices)
 
         time.sleep(PRICE_POLL_SECONDS)
 
@@ -265,7 +192,7 @@ app = FastAPI(title="BumbleBee Bot")
 
 class StartRequest(BaseModel):
     mode: str
-    sessions: Optional[int]
+    sessions: int
     wallet_id: Optional[str] = None
 
 @app.post("/start")
@@ -291,6 +218,6 @@ def status():
     return STATE.__dict__
 
 # =========================
-# START
+# START THREAD
 # =========================
 threading.Thread(target=bot_loop, daemon=True).start()
