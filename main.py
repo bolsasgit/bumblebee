@@ -59,12 +59,13 @@ init_db()
 # STATE
 # =========================
 class BotState:
-    running = False
-    mode = "paper"
-    max_sessions: Optional[int] = None
-    current_sessions = 0
-    wallet_id: Optional[str] = None
-    status_msg = "stopped"
+    def __init__(self):
+        self.running = False
+        self.mode = "paper"
+        self.max_sessions: Optional[int] = None
+        self.current_sessions = 0
+        self.wallet_id: Optional[str] = None
+        self.status_msg = "stopped"
 
 STATE = BotState()
 LOCK = threading.Lock()
@@ -215,7 +216,14 @@ def stop_bot():
 
 @app.get("/status")
 def status():
-    return STATE.__dict__
+    return {
+        "running": STATE.running,
+        "mode": STATE.mode,
+        "max_sessions": STATE.max_sessions,
+        "current_sessions": STATE.current_sessions,
+        "wallet_id": STATE.wallet_id,
+        "status_msg": STATE.status_msg
+    }
 
 # =========================
 # START THREAD
