@@ -1,5 +1,5 @@
 # ======================================================
-# 🐝 BumbleBee v19.1 beta
+# 🐝 BumbleBee v19.2 beta
 # ======================================================
 
 import time
@@ -43,7 +43,7 @@ def init_db():
         shares_yes INTEGER DEFAULT 0,
         shares_no INTEGER DEFAULT 0,
         max_price REAL,
-        profit REAL DEFAULT 0
+        profit REAL
     );
 
     CREATE TABLE IF NOT EXISTS trades (
@@ -74,10 +74,12 @@ class BotState:
         self.status_msg = "IDLE"
 
         # market detection
-        self.active_markets = []
+        self.active_markets: List[Dict] = []
         self.last_market_refresh = 0
-        self.current_market = None
+        self.current_market: Optional[Dict] = None
 
+STATE = BotState()
+LOCK = threading.Lock()
 
 # =========================
 # MARKET DETECTION
@@ -121,7 +123,7 @@ def get_latest_prices():
         side = (t.get("outcome") or "").upper()
         price = float(t.get("price"))
         if side == "YES": yes = price
-        elif side == "NO":  no = price
+        elif side == "NO": no = price
         if yes is not None and no is not None:
             return yes, no
     return None
@@ -294,7 +296,7 @@ def status():
     return STATE.__dict__
 
 # =========================
-# DASHBOARD (v19.1)
+# DASHBOARD
 # =========================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -305,6 +307,18 @@ def dashboard():
     cur.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 20")
     trades = cur.fetchall()
     conn.close()
+
+    sess_rows = []
+    for s in sessions:
+        sess_rows.append(
+            f"<tr><td>{s[0]}</td><td>{s[6] or 0}</td><td>{s[7] or 0}</td><td>{round(s[9],4) if s[9] is not None else 0}</td></tr>"
+        )
+
+    trade_rows = []
+    for t in trades:
+        trade_rows.append(
+            f"<tr><td>{t[3]}</td><td>{t[4]}</td><td>{t[5]}</td><td>{t[2]}</td></tr>"
+        )
 
     html = f"""
     <html>
@@ -322,7 +336,6 @@ def dashboard():
       table {{ width:100%;border-collapse:collapse;margin-top:15px;font-size:16px }}
       th,td {{ border:1px solid #666;padding:8px;text-align:center }}
       th {{ background:#3a3a3a }}
-      a {{ color:#f5f5f5;text-decoration:none;font-size:18px;margin-right:15px }}
     </style>
     </head>
     <body>
@@ -333,61 +346,45 @@ def dashboard():
     <div class="box">
       <label>Shares (por lado)</label>
       <input id="shares" value="{STATE.shares}">
-      <div class="tip">Quantidade máxima por lado</div>
-
       <label>Preço máximo</label>
       <input id="mp" value="{STATE.max_price}">
-      <div class="tip">Compra YES ou NO até este preço</div>
-
       <label>Max Sessions</label>
       <input id="ms">
-      <div class="tip">0 ou vazio = 24/7</div>
-
       <label>Modo</label>
-      <select id="mode">
-        <option value="paper">paper</option>
-        <option value="real">real</option>
-      </select><br><br>
-
-      <button id="save" onclick="save(this)">SALVAR</button><br><br>
-      <button id="start" onclick="startBot(this)">START</button><br><br>
-      <button id="stop" onclick="stopBot(this)">STOP</button>
+      <select id="mode"><option>paper</option><option>real</option></select><br><br>
+      <button id="save">SALVAR</button><br><br>
+      <button id="start">START</button><br><br>
+      <button id="stop">STOP</button>
     </div>
 
     <div class="box">
       <h2>Sessões</h2>
-      <table>
-        <tr><th>ID</th><th>YES</th><th>NO</th><th>Profit</th></tr>
-        {''.join(f"<tr><td>{s[0]}</td><td>{s[6]}</td><td>{s[7]}</td><td>{round(s[9],4)}</td></tr>" for s in sessions)}
+      <table><tr><th>ID</th><th>YES</th><th>NO</th><th>Profit</th></tr>
+      {''.join(sess_rows)}
       </table>
     </div>
 
     <div class="box">
       <h2>Trades</h2>
-      <table>
-        <tr><th>Side</th><th>Price</th><th>Shares</th><th>Time</th></tr>
-        {''.join(f"<tr><td>{t[3]}</td><td>{t[4]}</td><td>{t[5]}</td><td>{t[2]}</td></tr>" for t in trades)}
+      <table><tr><th>Side</th><th>Price</th><th>Shares</th><th>Time</th></tr>
+      {''.join(trade_rows)}
       </table>
     </div>
 
     <script>
-      function glow(b) {{
-        b.classList.add('glow');
-        setTimeout(()=>b.classList.remove('glow'),600);
-      }}
+      const visor = document.getElementById("visor");
+      const start = document.getElementById("start");
+      const stop  = document.getElementById("stop");
 
       async function refresh() {{
         const r = await fetch('/status');
         const s = await r.json();
-
         visor.innerText = s.status_msg;
-
         start.disabled = s.running;
         stop.disabled  = !s.running;
       }}
 
-      async function save(b) {{
-        glow(b);
+      document.getElementById("save").onclick = async () => {{
         await fetch('/controls', {{
           method:'POST',
           headers:{{'Content-Type':'application/json'}},
@@ -398,17 +395,10 @@ def dashboard():
             mode:mode.value
           }})
         }});
-      }}
+      }};
 
-      async function startBot(b) {{
-        glow(b);
-        await fetch('/start', {{method:'POST'}});
-      }}
-
-      async function stopBot(b) {{
-        glow(b);
-        await fetch('/stop', {{method:'POST'}});
-      }}
+      start.onclick = async () => {{ await fetch('/start', {{method:'POST'}}); }};
+      stop.onclick  = async () => {{ await fetch('/stop',  {{method:'POST'}}); }};
 
       setInterval(refresh, 2000);
       refresh();
