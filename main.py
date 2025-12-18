@@ -19,6 +19,8 @@ DB_NAME = "polymarket.db"
 PRICE_POLL_SECONDS = 5
 T2_THRESHOLD = 0.85
 
+MODE = "paper"
+
 # =========================
 # DB
 # =========================
@@ -62,7 +64,7 @@ init_db()
 class BotState:
     def __init__(self):
         self.running = False
-        self.mode = "paper"
+        self.mode = MODE
         self.max_sessions: Optional[int] = None
         self.current_sessions = 0
         self.wallet_id: Optional[str] = None
@@ -100,7 +102,7 @@ def get_latest_yes_no_prices():
             yes = price
         elif side == "NO":
             no = price
-        if yes and no:
+        if yes is not None and no is not None:
             return {"YES": yes, "NO": no}
     return None
 
@@ -222,7 +224,8 @@ def status():
         "max_sessions": STATE.max_sessions,
         "current_sessions": STATE.current_sessions,
         "wallet_id": STATE.wallet_id,
-        "status_msg": STATE.status_msg
+        "status_msg": STATE.status_msg,
+        "timestamp": time.time()
     }
 
 # =========================
