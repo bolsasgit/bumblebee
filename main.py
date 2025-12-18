@@ -97,16 +97,19 @@ def load_candidate_markets():
             out.append(m)
     return out
 
-def refresh_markets_if_needed():
+def refresh_markets_if_needed(force=False):
     now = time.time()
-    if now - STATE.last_market_refresh < MARKET_REFRESH_SECONDS:
+
+    if not force and now - STATE.last_market_refresh < MARKET_REFRESH_SECONDS:
         return
+
     try:
         markets = load_candidate_markets()
         if markets:
             STATE.active_markets = markets
             STATE.last_market_refresh = now
-    except:
+            STATE.status_msg = "MERCADOS ATUALIZADOS"
+    except Exception as e:
         STATE.status_msg = "ERRO AO CARREGAR MERCADOS"
 
 def select_active_market():
@@ -145,7 +148,8 @@ def bot_loop():
                 time.sleep(1)
                 continue
 
-        refresh_markets_if_needed()
+        # força refresh se ainda não tem mercado
+        refresh_markets_if_needed(force=(session_condition is None))
         market = select_active_market()
 
         if session_id is None:
