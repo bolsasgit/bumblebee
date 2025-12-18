@@ -1,5 +1,5 @@
 # ======================================================
-# 🐝 BumbleBee v19.4 beta
+# 🐝 BumbleBee v19.5 beta
 # ======================================================
 
 import time
@@ -69,7 +69,7 @@ class BotState:
         self.mode = "paper"
         self.shares = 20
         self.max_price = 0.6
-        self.max_sessions = None
+        self.max_sessions = None   # None = 24/7
         self.current_sessions = 0
         self.status_msg = "IDLE"
         self.start_time = None
@@ -214,6 +214,9 @@ def bot_loop():
 
             with LOCK:
                 STATE.current_sessions += 1
+                if STATE.max_sessions and STATE.current_sessions >= STATE.max_sessions:
+                    STATE.running = False
+                    STATE.status_msg = "LIMITE DE SESSÕES ATINGIDO"
 
             session_id = None
             session_condition = None
@@ -256,7 +259,7 @@ def bot_loop():
 # =========================
 # API
 # =========================
-app = FastAPI(title="BumbleBee v19.4 beta")
+app = FastAPI(title="BumbleBee v19.5 beta")
 
 class ControlReq(BaseModel):
     shares: Optional[int] = None
@@ -337,6 +340,7 @@ def dashboard():
     <style>
       body {{ background:#2b2b2b;color:#fff;font-family:Arial;padding:20px;font-size:13px }}
       h1 {{ text-align:center;font-size:26px }}
+      #visor {{ text-align:center;color:#ff4444;font-size:20px;margin:10px 0 }}
       .box {{ border:2px solid #ffd700;padding:10px;border-radius:8px;margin-bottom:15px }}
       input,select,button {{ font-size:13px;padding:4px }}
       table {{ width:100%;border-collapse:collapse;font-size:12px }}
@@ -346,16 +350,19 @@ def dashboard():
     </head>
     <body>
 
-    <h1>🐝 BumbleBee v19.4 beta</h1>
+    <h1>🐝 BumbleBee v19.5 beta</h1>
+    <div id="visor">IDLE</div>
 
     <div class="box">
       Shares <input id="shares" value="{STATE.shares}">
       Max Price <input id="mp" value="{STATE.max_price}">
+      Max Sessions <input id="ms" placeholder="0 = 24/7">
       Mode <select id="mode"><option>paper</option><option>real</option></select>
       <button onclick="save()">SALVAR</button>
       <button onclick="start()">START</button>
       <button onclick="stop()">STOP</button>
       &nbsp;&nbsp; ⏱️ <span id="elapsed">--</span>
+      &nbsp;&nbsp; 📊 Sessões: <b>{STATE.current_sessions}</b>
       &nbsp;&nbsp; 💰 Total Profit: <b>{round(total_profit,4)}</b>
     </div>
 
@@ -385,6 +392,7 @@ def dashboard():
         const r = await fetch('/status');
         const s = await r.json();
         document.getElementById("elapsed").innerText = s.elapsed;
+        document.getElementById("visor").innerText = s.status_msg;
       }}
       async function save(){{
         await fetch('/controls', {{
@@ -393,6 +401,7 @@ def dashboard():
           body:JSON.stringify({{
             shares:+shares.value,
             max_price:+mp.value,
+            max_sessions: ms.value ? +ms.value : 0,
             mode:mode.value
           }})
         }});
