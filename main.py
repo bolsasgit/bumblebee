@@ -1,3 +1,7 @@
+# ======================================================
+# 🐝 BumbleBee v19.1 beta
+# ======================================================
+
 import time
 import threading
 import sqlite3
@@ -8,10 +12,6 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-# ======================================================
-# 🐝 BumbleBee v19-beta (market detection adapted)
-# ======================================================
-
 # =========================
 # CONFIG
 # =========================
@@ -20,7 +20,7 @@ DATA_API  = "https://data-api.polymarket.com"
 
 DB_NAME = "polymarket.db"
 PRICE_POLL_SECONDS = 5
-MARKET_REFRESH_SECONDS = 30   # revalida universo de mercados (modelo update_markets)
+MARKET_REFRESH_SECONDS = 30
 
 # =========================
 # DB
@@ -72,7 +72,6 @@ class BotState:
     current_sessions = 0
     status_msg = "IDLE"
 
-    # --- market detection state (adapted model)
     active_markets: List[Dict] = []
     last_market_refresh = 0
     current_market: Optional[Dict] = None
@@ -81,25 +80,20 @@ STATE = BotState()
 LOCK = threading.Lock()
 
 # =========================
-# MARKET DETECTION (ADAPTED)
+# MARKET DETECTION
 # =========================
 def load_candidate_markets():
-    """
-    Equivalent to update_markets(): define universe first.
-    Fetch active/open markets and keep BTC ~15m candidates.
-    """
     r = requests.get(
         f"{GAMMA_API}/markets",
         params={"active": True, "closed": False, "limit": 200},
         timeout=10
     )
-    candidates = []
+    out = []
     for m in r.json():
         q = (m.get("question") or "").lower()
-        # robust filter (no exact string dependency)
         if "btc" in q and ("15" in q or "15m" in q or "15-min" in q):
-            candidates.append(m)
-    return candidates
+            out.append(m)
+    return out
 
 def refresh_markets_if_needed():
     now = time.time()
@@ -111,13 +105,8 @@ def refresh_markets_if_needed():
             pass
 
 def select_active_market():
-    """
-    Pick the first valid candidate. If conditionId changes,
-    bot will close/open sessions accordingly.
-    """
     if not STATE.active_markets:
         return None
-    # choose the soonest-ending active market
     def end_ts(m):
         try:
             return datetime.fromisoformat(m["endDate"].replace("Z","+00:00"))
@@ -132,7 +121,7 @@ def get_latest_prices():
         side = (t.get("outcome") or "").upper()
         price = float(t.get("price"))
         if side == "YES": yes = price
-        elif side == "NO": no = price
+        elif side == "NO":  no = price
         if yes is not None and no is not None:
             return yes, no
     return None
@@ -151,11 +140,10 @@ def bot_loop():
                 time.sleep(1)
                 continue
 
-        # refresh universe (model from provided script)
         refresh_markets_if_needed()
         market = select_active_market()
 
-        # session is CREATED ON START (even without market)
+        # sessão nasce no START
         if session_id is None:
             conn = db()
             cur = conn.cursor()
@@ -176,7 +164,6 @@ def bot_loop():
             conn.close()
             STATE.status_msg = "SESSÃO INICIADA"
 
-        # if market appears or changes, associate
         if market and market.get("conditionId") != session_condition:
             session_condition = market["conditionId"]
             session_end = datetime.fromisoformat(
@@ -193,12 +180,10 @@ def bot_loop():
             conn.close()
             STATE.status_msg = "MERCADO ASSOCIADO"
 
-        # if no market yet, just wait
         if not market:
             time.sleep(PRICE_POLL_SECONDS)
             continue
 
-        # end session
         if datetime.now(timezone.utc) >= session_end:
             conn = db()
             cur = conn.cursor()
@@ -211,10 +196,11 @@ def bot_loop():
                 FROM trades WHERE session_id=?
             """, (session_id,))
             cost_yes, cost_no, sy, sn = cur.fetchone()
-            cost_yes = cost_yes or 0; cost_no = cost_no or 0
-            sy = sy or 0; sn = sn or 0
-            payoff = min(sy, sn) * 1.0
-            profit = payoff - (cost_yes + cost_no)
+            cost_yes = cost_yes or 0
+            cost_no  = cost_no  or 0
+            sy = sy or 0
+            sn = sn or 0
+            profit = min(sy, sn) - (cost_yes + cost_no)
 
             cur.execute("""
                 UPDATE sessions SET end_ts=?, profit=? WHERE id=?
@@ -233,7 +219,6 @@ def bot_loop():
             session_end = None
             continue
 
-        # trading (independent sides)
         prices = get_latest_prices()
         if prices:
             yes, no = prices
@@ -270,7 +255,7 @@ def bot_loop():
 # =========================
 # API
 # =========================
-app = FastAPI(title="BumbleBee v19-beta")
+app = FastAPI(title="BumbleBee v19.1 beta")
 
 class ControlReq(BaseModel):
     shares: Optional[int] = None
@@ -309,7 +294,7 @@ def status():
     return STATE.__dict__
 
 # =========================
-# DASHBOARD (kept as-is)
+# DASHBOARD (v19.1)
 # =========================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -322,7 +307,8 @@ def dashboard():
     conn.close()
 
     html = f"""
-    <html><head>
+    <html>
+    <head>
     <style>
       body {{ background:#2b2b2b;color:#fff;font-family:Arial;padding:40px }}
       h1 {{ text-align:center;font-size:34px }}
@@ -331,34 +317,41 @@ def dashboard():
       label {{ font-size:18px;display:block;margin-top:14px }}
       .tip {{ font-size:13px;color:#ccc }}
       input,select,button {{ padding:12px;font-size:18px;margin-top:6px;margin-right:8px }}
+      button {{ border:none;border-radius:6px;cursor:pointer }}
+      .glow {{ box-shadow:0 0 14px }}
       table {{ width:100%;border-collapse:collapse;margin-top:15px;font-size:16px }}
       th,td {{ border:1px solid #666;padding:8px;text-align:center }}
       th {{ background:#3a3a3a }}
       a {{ color:#f5f5f5;text-decoration:none;font-size:18px;margin-right:15px }}
     </style>
-    </head><body>
-    <h1>🐝 BumbleBee v19-beta</h1>
-    <div id="visor">{STATE.status_msg}</div>
+    </head>
+    <body>
+
+    <h1>🐝 BumbleBee v19.1 beta</h1>
+    <div id="visor"></div>
 
     <div class="box">
       <label>Shares (por lado)</label>
       <input id="shares" value="{STATE.shares}">
-      <div class="tip">Limite por lado</div>
+      <div class="tip">Quantidade máxima por lado</div>
 
       <label>Preço máximo</label>
       <input id="mp" value="{STATE.max_price}">
-      <div class="tip">Compra YES/NO até este preço</div>
+      <div class="tip">Compra YES ou NO até este preço</div>
 
       <label>Max Sessions</label>
       <input id="ms">
-      <div class="tip">0/vazio = 24/7</div>
+      <div class="tip">0 ou vazio = 24/7</div>
 
       <label>Modo</label>
-      <select id="mode"><option>paper</option><option>real</option></select><br><br>
+      <select id="mode">
+        <option value="paper">paper</option>
+        <option value="real">real</option>
+      </select><br><br>
 
-      <button onclick="save()">SALVAR</button>
-      <button onclick="startBot()">START</button>
-      <button onclick="stopBot()">STOP</button>
+      <button id="save" onclick="save(this)">SALVAR</button><br><br>
+      <button id="start" onclick="startBot(this)">START</button><br><br>
+      <button id="stop" onclick="stopBot(this)">STOP</button>
     </div>
 
     <div class="box">
@@ -377,21 +370,52 @@ def dashboard():
       </table>
     </div>
 
-    <div class="box">
-      <a href="https://polymarket.com" target="_blank">Polymarket</a>
-      <a href="https://kashi.io" target="_blank">Kashi</a>
-    </div>
-
     <script>
-      async function save(){{
-        await fetch('/controls',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-          body:JSON.stringify({{shares:+shares.value,max_price:+mp.value,
-          max_sessions:ms.value?+ms.value:0,mode:mode.value}})}});
+      function glow(b) {{
+        b.classList.add('glow');
+        setTimeout(()=>b.classList.remove('glow'),600);
       }}
-      async function startBot(){{ await fetch('/start',{{method:'POST'}}); }}
-      async function stopBot(){{ await fetch('/stop',{{method:'POST'}}); }}
+
+      async function refresh() {{
+        const r = await fetch('/status');
+        const s = await r.json();
+
+        visor.innerText = s.status_msg;
+
+        start.disabled = s.running;
+        stop.disabled  = !s.running;
+      }}
+
+      async function save(b) {{
+        glow(b);
+        await fetch('/controls', {{
+          method:'POST',
+          headers:{{'Content-Type':'application/json'}},
+          body:JSON.stringify({{
+            shares:+shares.value,
+            max_price:+mp.value,
+            max_sessions: ms.value ? +ms.value : 0,
+            mode:mode.value
+          }})
+        }});
+      }}
+
+      async function startBot(b) {{
+        glow(b);
+        await fetch('/start', {{method:'POST'}});
+      }}
+
+      async function stopBot(b) {{
+        glow(b);
+        await fetch('/stop', {{method:'POST'}});
+      }}
+
+      setInterval(refresh, 2000);
+      refresh();
     </script>
-    </body></html>
+
+    </body>
+    </html>
     """
     return html
 
