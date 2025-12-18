@@ -1,5 +1,5 @@
 # ======================================================
-# 🐝 BumbleBee v19.2 beta
+# 🐝 BumbleBee v19.3 beta
 # ======================================================
 
 import time
@@ -68,12 +68,12 @@ class BotState:
         self.running = False
         self.mode = "paper"
         self.shares = 20
-        self.max_price = 0.35
+        self.max_price = 0.6
         self.max_sessions = None
         self.current_sessions = 0
         self.status_msg = "IDLE"
+        self.start_time = None
 
-        # market detection
         self.active_markets: List[Dict] = []
         self.last_market_refresh = 0
         self.current_market: Optional[Dict] = None
@@ -99,12 +99,15 @@ def load_candidate_markets():
 
 def refresh_markets_if_needed():
     now = time.time()
-    if now - STATE.last_market_refresh >= MARKET_REFRESH_SECONDS:
-        try:
-            STATE.active_markets = load_candidate_markets()
+    if now - STATE.last_market_refresh < MARKET_REFRESH_SECONDS:
+        return
+    try:
+        markets = load_candidate_markets()
+        if markets:
+            STATE.active_markets = markets
             STATE.last_market_refresh = now
-        except:
-            pass
+    except:
+        STATE.status_msg = "ERRO AO CARREGAR MERCADOS"
 
 def select_active_market():
     if not STATE.active_markets:
@@ -145,7 +148,6 @@ def bot_loop():
         refresh_markets_if_needed()
         market = select_active_market()
 
-        # sessão nasce no START
         if session_id is None:
             conn = db()
             cur = conn.cursor()
@@ -212,9 +214,6 @@ def bot_loop():
 
             with LOCK:
                 STATE.current_sessions += 1
-                if STATE.max_sessions and STATE.current_sessions >= STATE.max_sessions:
-                    STATE.running = False
-                    STATE.status_msg = "LIMITE DE SESSÕES ATINGIDO"
 
             session_id = None
             session_condition = None
@@ -232,9 +231,8 @@ def bot_loop():
             if yes <= STATE.max_price and sy < STATE.shares:
                 buy = STATE.shares - sy
                 cur.execute("""
-                    INSERT INTO trades (session_id, ts, side, price, shares)
-                    VALUES (?, ?, 'YES', ?, ?)
-                """, (session_id, datetime.utcnow().isoformat(), yes, buy))
+                    INSERT INTO trades VALUES (NULL,?,?,?,?,?)
+                """, (session_id, datetime.utcnow().isoformat(), "YES", yes, buy))
                 cur.execute("UPDATE sessions SET shares_yes=shares_yes+? WHERE id=?",
                             (buy, session_id))
                 STATE.status_msg = f"BUY YES {buy} @ {yes}"
@@ -242,9 +240,8 @@ def bot_loop():
             if no <= STATE.max_price and sn < STATE.shares:
                 buy = STATE.shares - sn
                 cur.execute("""
-                    INSERT INTO trades (session_id, ts, side, price, shares)
-                    VALUES (?, ?, 'NO', ?, ?)
-                """, (session_id, datetime.utcnow().isoformat(), no, buy))
+                    INSERT INTO trades VALUES (NULL,?,?,?,?,?)
+                """, (session_id, datetime.utcnow().isoformat(), "NO", no, buy))
                 cur.execute("UPDATE sessions SET shares_no=shares_no+? WHERE id=?",
                             (buy, session_id))
                 STATE.status_msg = f"BUY NO {buy} @ {no}"
@@ -257,7 +254,7 @@ def bot_loop():
 # =========================
 # API
 # =========================
-app = FastAPI(title="BumbleBee v19.1 beta")
+app = FastAPI(title="BumbleBee v19.3 beta")
 
 class ControlReq(BaseModel):
     shares: Optional[int] = None
@@ -270,30 +267,20 @@ def start():
     with LOCK:
         STATE.running = True
         STATE.current_sessions = 0
+        STATE.start_time = time.time()
         STATE.status_msg = "BOT INICIADO"
-    return {"ok": True}
-
-@app.post("/stop")
-def stop():
-    with LOCK:
-        STATE.running = False
-        STATE.status_msg = "BOT PARADO"
-    return {"ok": True}
-
-@app.post("/controls")
-def controls(req: ControlReq):
-    with LOCK:
-        if req.shares is not None: STATE.shares = req.shares
-        if req.max_price is not None: STATE.max_price = req.max_price
-        if req.mode is not None: STATE.mode = req.mode
-        if req.max_sessions is not None:
-            STATE.max_sessions = req.max_sessions if req.max_sessions > 0 else None
-        STATE.status_msg = "CONFIGURAÇÕES SALVAS"
     return {"ok": True}
 
 @app.get("/status")
 def status():
-    return STATE.__dict__
+    elapsed = int(time.time() - STATE.start_time) if STATE.start_time else 0
+    h = elapsed // 3600
+    m = (elapsed % 3600) // 60
+    s = elapsed % 60
+    return {
+        **STATE.__dict__,
+        "elapsed": f"{h:02d}:{m:02d}:{s:02d}"
+    }
 
 # =========================
 # DASHBOARD
@@ -302,105 +289,52 @@ def status():
 def dashboard():
     conn = db()
     cur = conn.cursor()
+    cur.execute("SELECT profit FROM sessions WHERE profit IS NOT NULL")
+    total_profit = sum(r[0] for r in cur.fetchall() if r[0] is not None)
     cur.execute("SELECT * FROM sessions ORDER BY id DESC LIMIT 5")
     sessions = cur.fetchall()
-    cur.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 20")
-    trades = cur.fetchall()
     conn.close()
-
-    sess_rows = []
-    for s in sessions:
-        sess_rows.append(
-            f"<tr><td>{s[0]}</td><td>{s[6] or 0}</td><td>{s[7] or 0}</td><td>{round(s[9],4) if s[9] is not None else 0}</td></tr>"
-        )
-
-    trade_rows = []
-    for t in trades:
-        trade_rows.append(
-            f"<tr><td>{t[3]}</td><td>{t[4]}</td><td>{t[5]}</td><td>{t[2]}</td></tr>"
-        )
 
     html = f"""
     <html>
     <head>
     <style>
-      body {{ background:#2b2b2b;color:#fff;font-family:Arial;padding:40px }}
-      h1 {{ text-align:center;font-size:34px }}
-      #visor {{ text-align:center;color:#ff4444;font-size:26px;margin-bottom:35px }}
-      .box {{ border:2px solid #ffd700;padding:22px;margin-bottom:25px;border-radius:8px }}
-      label {{ font-size:18px;display:block;margin-top:14px }}
-      .tip {{ font-size:13px;color:#ccc }}
-      input,select,button {{ padding:12px;font-size:18px;margin-top:6px;margin-right:8px }}
-      button {{ border:none;border-radius:6px;cursor:pointer }}
-      .glow {{ box-shadow:0 0 14px }}
-      table {{ width:100%;border-collapse:collapse;margin-top:15px;font-size:16px }}
-      th,td {{ border:1px solid #666;padding:8px;text-align:center }}
-      th {{ background:#3a3a3a }}
+      body {{ background:#2b2b2b;color:#fff;font-family:Arial;padding:20px;font-size:14px }}
+      h1 {{ text-align:center;font-size:26px }}
+      .top {{ display:flex;justify-content:space-between;align-items:center }}
+      .box {{ border:2px solid #ffd700;padding:12px;border-radius:8px }}
+      input,select,button {{ font-size:14px;padding:6px }}
+      table {{ width:100%;border-collapse:collapse;font-size:13px }}
+      th,td {{ border:1px solid #666;padding:6px;text-align:center }}
     </style>
     </head>
     <body>
 
-    <h1>🐝 BumbleBee v19.1 beta</h1>
-    <div id="visor"></div>
+    <h1>🐝 BumbleBee v19.3 beta</h1>
 
-    <div class="box">
-      <label>Shares (por lado)</label>
-      <input id="shares" value="{STATE.shares}">
-      <label>Preço máximo</label>
-      <input id="mp" value="{STATE.max_price}">
-      <label>Max Sessions</label>
-      <input id="ms">
-      <label>Modo</label>
-      <select id="mode"><option>paper</option><option>real</option></select><br><br>
-      <button id="save">SALVAR</button><br><br>
-      <button id="start">START</button><br><br>
-      <button id="stop">STOP</button>
-    </div>
-
-    <div class="box">
-      <h2>Sessões</h2>
-      <table><tr><th>ID</th><th>YES</th><th>NO</th><th>Profit</th></tr>
-      {''.join(sess_rows)}
-      </table>
-    </div>
-
-    <div class="box">
-      <h2>Trades</h2>
-      <table><tr><th>Side</th><th>Price</th><th>Shares</th><th>Time</th></tr>
-      {''.join(trade_rows)}
-      </table>
+    <div class="top box">
+      <div>
+        Shares <input id="shares" value="{STATE.shares}">
+        Max Price <input id="mp" value="{STATE.max_price}">
+        Mode <select id="mode"><option>paper</option><option>real</option></select>
+        <button onclick="start()">START</button>
+      </div>
+      <div>
+        ⏱️ Elapsed: <b id="elapsed">--</b><br>
+        💰 Total Profit: <b>{round(total_profit,4)}</b>
+      </div>
     </div>
 
     <script>
-      const visor = document.getElementById("visor");
-      const start = document.getElementById("start");
-      const stop  = document.getElementById("stop");
-
-      async function refresh() {{
+      async function refresh(){{
         const r = await fetch('/status');
         const s = await r.json();
-        visor.innerText = s.status_msg;
-        start.disabled = s.running;
-        stop.disabled  = !s.running;
+        document.getElementById("elapsed").innerText = s.elapsed;
       }}
-
-      document.getElementById("save").onclick = async () => {{
-        await fetch('/controls', {{
-          method:'POST',
-          headers:{{'Content-Type':'application/json'}},
-          body:JSON.stringify({{
-            shares:+shares.value,
-            max_price:+mp.value,
-            max_sessions: ms.value ? +ms.value : 0,
-            mode:mode.value
-          }})
-        }});
-      }};
-
-      start.onclick = async () => {{ await fetch('/start', {{method:'POST'}}); }};
-      stop.onclick  = async () => {{ await fetch('/stop',  {{method:'POST'}}); }};
-
-      setInterval(refresh, 2000);
+      async function start(){{
+        await fetch('/start',{{method:'POST'}});
+      }}
+      setInterval(refresh,2000);
       refresh();
     </script>
 
@@ -410,6 +344,6 @@ def dashboard():
     return html
 
 # =========================
-# START
+# START THREAD
 # =========================
 threading.Thread(target=bot_loop, daemon=True).start()
