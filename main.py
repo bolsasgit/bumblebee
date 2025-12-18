@@ -34,18 +34,17 @@ def init_db():
         start_ts TEXT,
         end_ts TEXT,
         mode TEXT,
-        wallet_id TEXT,
-        shares INTEGER,
-        t2 REAL,
-        t3 REAL,
-        entered INTEGER DEFAULT 0
+        shares_target INTEGER,
+        shares_filled INTEGER DEFAULT 0,
+        threshold REAL
     );
 
-    CREATE TABLE IF NOT EXISTS price_snapshots (
+    CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id INTEGER,
         ts TEXT,
-        seconds_to_expiry INTEGER,
+        s_value REAL,
+        shares INTEGER,
         price_yes REAL,
         price_no REAL
     );
@@ -59,16 +58,11 @@ init_db()
 # STATE
 # =========================
 class BotState:
-    def __init__(self):
-        self.running = False
-        self.mode = "paper"
-        self.max_sessions = 1
-        self.current_sessions = 0
-        self.wallet_id = "pt"
-        self.t2 = 0.85
-        self.t3 = 0.70
-        self.shares = 20
-        self.status_msg = "idle"
+    running = False
+    mode = "paper"
+    shares = 20            # POR LADO
+    threshold = 0.70
+    status_msg = "idle"
 
 STATE = BotState()
 LOCK = threading.Lock()
@@ -88,7 +82,7 @@ def get_active_btc_15m_market():
             return m
     return None
 
-def get_latest_yes_no_prices():
+def get_latest_prices():
     r = requests.get(f"{DATA_API}/trades", params={"limit": 50}, timeout=10)
     yes = no = None
     for t in r.json():
@@ -107,8 +101,8 @@ def get_latest_yes_no_prices():
 # =========================
 def bot_loop():
     session_id = None
-    session_end_dt = None
-    entered = False
+    condition_id = None
+    session_end = None
 
     while True:
         with LOCK:
@@ -116,13 +110,14 @@ def bot_loop():
                 time.sleep(1)
                 continue
 
-        if not session_id:
-            market = get_active_btc_15m_market()
-            if not market:
-                time.sleep(5)
-                continue
+        market = get_active_btc_15m_market()
+        if not market:
+            time.sleep(5)
+            continue
 
-            session_end_dt = datetime.fromisoformat(
+        if market["conditionId"] != condition_id:
+            condition_id = market["conditionId"]
+            session_end = datetime.fromisoformat(
                 market["endDate"].replace("Z", "+00:00")
             )
 
@@ -130,69 +125,71 @@ def bot_loop():
             cur = conn.cursor()
             cur.execute("""
                 INSERT INTO sessions
-                (condition_id, market_question, start_ts, mode, wallet_id, shares, t2, t3)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (condition_id, market_question, start_ts, mode, shares_target, threshold)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, (
-                market["conditionId"],
+                condition_id,
                 market["question"],
                 datetime.utcnow().isoformat(),
                 STATE.mode,
-                STATE.wallet_id,
                 STATE.shares,
-                STATE.t2,
-                STATE.t3
+                STATE.threshold
             ))
             session_id = cur.lastrowid
             conn.commit()
             conn.close()
-            entered = False
 
-        seconds_left = int((session_end_dt - datetime.now(timezone.utc)).total_seconds())
-
+        seconds_left = int((session_end - datetime.now(timezone.utc)).total_seconds())
         if seconds_left <= 0:
             conn = db()
             cur = conn.cursor()
-            cur.execute("UPDATE sessions SET end_ts=? WHERE id=?",
-                        (datetime.utcnow().isoformat(), session_id))
+            cur.execute(
+                "UPDATE sessions SET end_ts=? WHERE id=?",
+                (datetime.utcnow().isoformat(), session_id)
+            )
             conn.commit()
             conn.close()
-
             session_id = None
-            with LOCK:
-                STATE.current_sessions += 1
-                if STATE.current_sessions >= STATE.max_sessions:
-                    STATE.running = False
-                    STATE.status_msg = "completed"
+            condition_id = None
             continue
 
-        prices = get_latest_yes_no_prices()
+        prices = get_latest_prices()
         if prices:
             yes, no = prices
+            s = yes + no
+
             conn = db()
             cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO price_snapshots
-                (session_id, ts, seconds_to_expiry, price_yes, price_no)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                session_id,
-                datetime.utcnow().isoformat(),
-                seconds_left,
-                yes, no
-            ))
-            conn.commit()
-            conn.close()
+            cur.execute("SELECT shares_filled FROM sessions WHERE id=?", (session_id,))
+            filled = cur.fetchone()[0]
 
-            if not entered:
-                s = yes + no
-                if s <= STATE.t3 or s <= STATE.t2:
-                    entered = True
-                    conn = db()
-                    cur = conn.cursor()
-                    cur.execute("UPDATE sessions SET entered=1 WHERE id=?", (session_id,))
-                    conn.commit()
-                    conn.close()
-                    STATE.status_msg = f"ENTROU {STATE.shares} SHARES ({STATE.mode})"
+            if s < STATE.threshold and filled < STATE.shares:
+                remaining = STATE.shares - filled
+
+                # EXECUTA SEMPRE NO MELHOR s DO MOMENTO
+                cur.execute("""
+                    INSERT INTO trades
+                    (session_id, ts, s_value, shares, price_yes, price_no)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    session_id,
+                    datetime.utcnow().isoformat(),
+                    s,
+                    remaining,
+                    yes,
+                    no
+                ))
+
+                cur.execute("""
+                    UPDATE sessions
+                    SET shares_filled = shares_filled + ?
+                    WHERE id=?
+                """, (remaining, session_id))
+
+                conn.commit()
+                conn.close()
+
+                STATE.status_msg = f"EXECUTOU {remaining} YES + {remaining} NO @ s={round(s,4)}"
 
         time.sleep(PRICE_POLL_SECONDS)
 
@@ -202,44 +199,34 @@ def bot_loop():
 app = FastAPI(title="BumbleBee")
 
 class ControlReq(BaseModel):
-    t2: Optional[float] = None
-    t3: Optional[float] = None
     shares: Optional[int] = None
+    threshold: Optional[float] = None
     mode: Optional[str] = None
-    max_sessions: Optional[int] = None
 
 @app.post("/start")
-def start_bot():
+def start():
     with LOCK:
         STATE.running = True
-        STATE.current_sessions = 0
-        STATE.status_msg = "bot iniciado"
+        STATE.status_msg = "running"
     return {"ok": True}
 
 @app.post("/stop")
-def stop_bot():
+def stop():
     with LOCK:
         STATE.running = False
-        STATE.status_msg = "bot parado"
-    return {"ok": True}
-
-@app.post("/reset")
-def reset_bot():
-    with LOCK:
-        STATE.running = False
-        STATE.current_sessions = 0
-        STATE.status_msg = "estado resetado"
+        STATE.status_msg = "stopped"
     return {"ok": True}
 
 @app.post("/controls")
-def update_controls(req: ControlReq):
+def controls(req: ControlReq):
     with LOCK:
-        if req.t2 is not None: STATE.t2 = req.t2
-        if req.t3 is not None: STATE.t3 = req.t3
-        if req.shares is not None: STATE.shares = req.shares
-        if req.mode is not None: STATE.mode = req.mode
-        if req.max_sessions is not None: STATE.max_sessions = req.max_sessions
-        STATE.status_msg = "controles atualizados"
+        if req.shares is not None:
+            STATE.shares = req.shares
+        if req.threshold is not None:
+            STATE.threshold = req.threshold
+        if req.mode is not None:
+            STATE.mode = req.mode
+        STATE.status_msg = "controls updated"
     return {"ok": True}
 
 @app.get("/status")
@@ -253,91 +240,45 @@ def status():
 def dashboard():
     html = f"""
     <html>
-    <head>
-    <style>
-      body {{ background:#0f0f0f; color:#fff; font-family:Arial; padding:30px }}
-      input, select, button {{ padding:10px; font-size:15px; margin:5px }}
-      button {{ border:none; border-radius:6px; cursor:pointer }}
-      .on {{ background:#00c853 }}
-      .off {{ background:#d50000 }}
-      .box {{ border:2px solid gold; padding:15px; margin-top:15px }}
-      .hint {{ font-size:12px; color:#aaa }}
-    </style>
-    </head>
-    <body>
+    <body style="background:#0f0f0f;color:white;font-family:Arial;padding:30px">
+      <h1>BUMBLEBEE — STRUCTURAL BOT</h1>
 
-    <h1>BUMBLEBEE — CONTROL DASH</h1>
+      <div>
+        Shares por lado:
+        <input id="shares" value="{STATE.shares}">
+        <br>
+        Threshold (YES+NO):
+        <input id="thr" value="{STATE.threshold}">
+        <br><br>
+        <button onclick="save()">SALVAR</button>
+        <button onclick="start()">START</button>
+        <button onclick="stop()">STOP</button>
+      </div>
 
-    <div class="box">
-      <label>T2 (%)</label>
-      <input id="t2" value="{STATE.t2}">
-      <div class="hint">Entrada conservadora (soma YES+NO abaixo deste valor)</div>
-
-      <label>T3 (%)</label>
-      <input id="t3" value="{STATE.t3}">
-      <div class="hint">Entrada agressiva (edge maior, risco maior)</div>
-
-      <label>Shares</label>
-      <input id="shares" value="{STATE.shares}">
-      <div class="hint">Quantidade fixa de shares por sessão (1 trade)</div>
-
-      <label>Max Sessions</label>
-      <input id="maxs" value="{STATE.max_sessions}">
-      <div class="hint">Número de sessões de 15 min antes de parar</div>
-
-      <label>Modo</label>
-      <select id="mode">
-        <option value="paper">paper</option>
-        <option value="real">real</option>
-      </select>
-      <div class="hint">Paper = simulação | Real = dinheiro</div>
-
-      <button onclick="save()">SALVAR CONFIG</button>
-    </div>
-
-    <div class="box">
-      <button class="on" onclick="start()">START</button>
-      <span class="hint">Inicia o bot com as configurações atuais</span><br>
-
-      <button class="off" onclick="stop()">STOP</button>
-      <span class="hint">Para imediatamente após a sessão atual</span><br>
-
-      <button onclick="reset()">RESET</button>
-      <span class="hint">Zera sessões e estado (não apaga histórico)</span>
-    </div>
-
-    <div class="box">
-      <h3>VISOR</h3>
+      <h3>Status</h3>
       <p id="visor">{STATE.status_msg}</p>
-      <div class="hint">Mostra a última ação executada</div>
-    </div>
 
-    <script>
-      async function save(){{
-        await fetch('/controls', {{
-          method:'POST',
-          headers:{{'Content-Type':'application/json'}},
-          body:JSON.stringify({{
-            t2:parseFloat(t2.value),
-            t3:parseFloat(t3.value),
-            shares:parseInt(shares.value),
-            max_sessions:parseInt(maxs.value),
-            mode:mode.value
-          }})
-        }});
-        visor.innerText="CONFIGURAÇÕES SALVAS";
-      }}
-      async function start(){{ await fetch('/start',{{method:'POST'}}); visor.innerText="BOT INICIADO"; }}
-      async function stop(){{ await fetch('/stop',{{method:'POST'}}); visor.innerText="BOT PARADO"; }}
-      async function reset(){{ await fetch('/reset',{{method:'POST'}}); visor.innerText="RESET EXECUTADO"; }}
-    </script>
-
+      <script>
+        async function save(){{
+          await fetch('/controls', {{
+            method:'POST',
+            headers:{{'Content-Type':'application/json'}},
+            body:JSON.stringify({{
+              shares:parseInt(shares.value),
+              threshold:parseFloat(thr.value)
+            }})
+          }});
+          visor.innerText="CONFIG SALVA";
+        }}
+        async function start(){{ await fetch('/start',{{method:'POST'}}); visor.innerText="RODANDO"; }}
+        async function stop(){{ await fetch('/stop',{{method:'POST'}}); visor.innerText="PARADO"; }}
+      </script>
     </body>
     </html>
     """
     return html
 
 # =========================
-# START THREAD
+# START
 # =========================
 threading.Thread(target=bot_loop, daemon=True).start()
