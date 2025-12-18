@@ -283,30 +283,122 @@ def dashboard():
     <html>
     <head>
     <style>
-      body {{ background:#0f0f0f; color:white; font-family:Arial; padding:20px }}
-      .box {{ border:2px solid gold; padding:15px; margin-top:15px }}
-      table {{ width:100%; border-collapse:collapse; color:white }}
-      td,th {{ border:1px solid #555; padding:5px; font-size:13px }}
-      #visor {{ text-align:center; color:red; font-size:22px }}
-      .glow {{ box-shadow:0 0 12px }}
+      body {{
+        background:#2b2b2b;
+        color:#ffffff;
+        font-family: Arial, sans-serif;
+        padding:40px;
+      }}
+      h1 {{
+        text-align:center;
+        margin-bottom:25px;
+        font-size:34px;
+      }}
+      #visor {{
+        text-align:center;
+        color:#ff4444;
+        font-size:26px;
+        margin-bottom:35px;
+      }}
+      .box {{
+        border:2px solid #ffd700;
+        padding:22px;
+        margin-bottom:25px;
+        border-radius:8px;
+      }}
+      label {{
+        font-size:18px;
+        display:block;
+        margin-top:14px;
+      }}
+      .tip {{
+        font-size:13px;
+        color:#cccccc;
+        margin-top:4px;
+      }}
+      input, select, button {{
+        padding:12px;
+        font-size:18px;
+        margin-top:6px;
+        margin-right:8px;
+      }}
+      button {{
+        border:none;
+        border-radius:6px;
+        cursor:pointer;
+      }}
+      .glow {{
+        box-shadow:0 0 14px;
+      }}
+      table {{
+        width:100%;
+        border-collapse:collapse;
+        margin-top:15px;
+        font-size:16px;
+      }}
+      th, td {{
+        border:1px solid #666;
+        padding:8px;
+        text-align:center;
+      }}
+      th {{
+        background:#3a3a3a;
+      }}
+      a {{
+        color:#f5f5f5;
+        text-decoration:none;
+        font-size:18px;
+        margin-right:15px;
+      }}
+      a:hover {{
+        text-decoration:underline;
+      }}
+      .footer {{
+        text-align:center;
+        margin-top:30px;
+      }}
     </style>
     </head>
     <body>
 
-    <div id="visor">🐝 BumbleBee v19 — {STATE.status_msg}</div>
+    <h1>🐝 BumbleBee v19</h1>
+
+    <div id="visor">{STATE.status_msg}</div>
 
     <div class="box">
-      Shares <input id="shares" value="{STATE.shares}">
-      Max Price <input id="mp" value="{STATE.max_price}">
-      Mode <select id="mode"><option>paper</option><option>real</option></select>
-      Max Sessions <input id="ms">
+      <label>Shares (por lado)</label>
+      <input id="shares" value="{STATE.shares}">
+      <div class="tip">Quantidade máxima de shares compradas em YES e em NO durante a sessão</div>
+
+      <label>Preço máximo (YES / NO)</label>
+      <input id="mp" value="{STATE.max_price}">
+      <div class="tip">O bot compra YES ou NO apenas se o preço for menor ou igual a este valor</div>
+
+      <label>Max Sessions</label>
+      <input id="ms">
+      <div class="tip">Vazio ou 0 = roda 24/7 | Número = total de sessões antes de parar</div>
+
+      <label>Modo</label>
+      <select id="mode">
+        <option value="paper">paper</option>
+        <option value="real">real</option>
+      </select>
+      <div class="tip">Paper = simulação | Real = execução futura</div>
+
+      <br><br>
       <button onclick="save(this)">SALVAR</button>
+      <span class="tip">Aplica as configurações acima</span><br><br>
+
       <button onclick="startBot(this)">START</button>
+      <span class="tip">Inicia o bot com as configurações atuais</span><br><br>
+
       <button onclick="stopBot(this)">STOP</button>
+      <span class="tip">Para o bot após a execução atual</span>
     </div>
 
     <div class="box">
-      <h3>Sessions</h3>
+      <h2>Sessões</h2>
+      <div class="tip">Resumo das últimas sessões (preenchimento e resultado)</div>
       <table>
         <tr><th>ID</th><th>YES</th><th>NO</th><th>Profit</th></tr>
         {''.join(f"<tr><td>{s[0]}</td><td>{s[6]}</td><td>{s[7]}</td><td>{round(s[9],4)}</td></tr>" for s in sessions)}
@@ -314,25 +406,48 @@ def dashboard():
     </div>
 
     <div class="box">
-      <h3>Trades</h3>
+      <h2>Trades</h2>
+      <div class="tip">Execuções individuais dentro das sessões</div>
       <table>
         <tr><th>Side</th><th>Price</th><th>Shares</th><th>Time</th></tr>
         {''.join(f"<tr><td>{t[3]}</td><td>{t[4]}</td><td>{t[5]}</td><td>{t[2]}</td></tr>" for t in trades)}
       </table>
     </div>
 
-    <div class="box">
-      <a href="https://polymarket.com" target="_blank">Polymarket</a> |
+    <div class="footer">
+      <a href="https://polymarket.com" target="_blank">Polymarket</a>
       <a href="https://kashi.io" target="_blank">Kashi</a>
     </div>
 
     <script>
-      function glow(b){{b.classList.add('glow');setTimeout(()=>b.classList.remove('glow'),600);}}
-      async function save(b){{glow(b);await fetch('/controls',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-        body:JSON.stringify({{shares:parseInt(shares.value),max_price:parseFloat(mp.value),
-        mode:mode.value,max_sessions:ms.value?parseInt(ms.value):0}})}});}}
-      async function startBot(b){{glow(b);await fetch('/start',{{method:'POST'}});}}
-      async function stopBot(b){{glow(b);await fetch('/stop',{{method:'POST'}});}}
+      function glow(b) {{
+        b.classList.add('glow');
+        setTimeout(()=>b.classList.remove('glow'),600);
+      }}
+      async function save(b) {{
+        glow(b);
+        await fetch('/controls', {{
+          method:'POST',
+          headers:{{'Content-Type':'application/json'}},
+          body:JSON.stringify({{
+            shares:parseInt(shares.value),
+            max_price:parseFloat(mp.value),
+            max_sessions: ms.value ? parseInt(ms.value) : 0,
+            mode:mode.value
+          }})
+        }});
+        visor.innerText="CONFIGURAÇÕES SALVAS";
+      }}
+      async function startBot(b) {{
+        glow(b);
+        await fetch('/start',{{method:'POST'}});
+        visor.innerText="BOT INICIADO";
+      }}
+      async function stopBot(b) {{
+        glow(b);
+        await fetch('/stop',{{method:'POST'}});
+        visor.innerText="BOT PARADO";
+      }}
     </script>
 
     </body>
