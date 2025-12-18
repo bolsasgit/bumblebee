@@ -64,20 +64,20 @@ init_db()
 # STATE
 # =========================
 class BotState:
-    running = False
-    mode = "paper"
-    shares = 20
-    max_price = 0.35
-    max_sessions = None
-    current_sessions = 0
-    status_msg = "IDLE"
+    def __init__(self):
+        self.running = False
+        self.mode = "paper"
+        self.shares = 20
+        self.max_price = 0.35
+        self.max_sessions = None
+        self.current_sessions = 0
+        self.status_msg = "IDLE"
 
-    active_markets: List[Dict] = []
-    last_market_refresh = 0
-    current_market: Optional[Dict] = None
+        # market detection
+        self.active_markets = []
+        self.last_market_refresh = 0
+        self.current_market = None
 
-STATE = BotState()
-LOCK = threading.Lock()
 
 # =========================
 # MARKET DETECTION
