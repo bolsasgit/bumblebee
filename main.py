@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 # ======================================================
-# BUMBLEBEE v18
+# 🐝 BumbleBee v19
 # ======================================================
 
 # =========================
@@ -39,18 +39,19 @@ def init_db():
         end_ts TEXT,
         mode TEXT,
         shares_target INTEGER,
-        shares_filled INTEGER DEFAULT 0,
-        threshold REAL
+        shares_yes INTEGER DEFAULT 0,
+        shares_no INTEGER DEFAULT 0,
+        max_price REAL,
+        profit REAL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id INTEGER,
         ts TEXT,
-        s_value REAL,
-        shares INTEGER,
-        price_yes REAL,
-        price_no REAL
+        side TEXT,
+        price REAL,
+        shares INTEGER
     );
     """)
     conn.commit()
@@ -65,7 +66,7 @@ class BotState:
     running = False
     mode = "paper"
     shares = 20              # por lado
-    threshold = 0.70
+    max_price = 0.35         # preço máximo por lado
     max_sessions = None      # None = 24/7
     current_sessions = 0
     status_msg = "IDLE"
@@ -131,7 +132,7 @@ def bot_loop():
             cur = conn.cursor()
             cur.execute("""
                 INSERT INTO sessions
-                (condition_id, market_question, start_ts, mode, shares_target, threshold)
+                (condition_id, market_question, start_ts, mode, shares_target, max_price)
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 condition_id,
@@ -139,20 +140,42 @@ def bot_loop():
                 datetime.utcnow().isoformat(),
                 STATE.mode,
                 STATE.shares,
-                STATE.threshold
+                STATE.max_price
             ))
             session_id = cur.lastrowid
             conn.commit()
             conn.close()
 
-        seconds_left = int((session_end - datetime.now(timezone.utc)).total_seconds())
-        if seconds_left <= 0:
+        # encerra sessão
+        if datetime.now(timezone.utc) >= session_end:
             conn = db()
             cur = conn.cursor()
-            cur.execute(
-                "UPDATE sessions SET end_ts=? WHERE id=?",
-                (datetime.utcnow().isoformat(), session_id)
-            )
+
+            # payoff estrutural = shares_yes + shares_no (cada lado vale 1 se correto)
+            cur.execute("""
+                SELECT
+                  SUM(CASE WHEN side='YES' THEN price*shares ELSE 0 END),
+                  SUM(CASE WHEN side='NO' THEN price*shares ELSE 0 END),
+                  SUM(CASE WHEN side='YES' THEN shares ELSE 0 END),
+                  SUM(CASE WHEN side='NO' THEN shares ELSE 0 END)
+                FROM trades WHERE session_id=?
+            """, (session_id,))
+            cost_yes, cost_no, sy, sn = cur.fetchone()
+
+            cost_yes = cost_yes or 0
+            cost_no = cost_no or 0
+            sy = sy or 0
+            sn = sn or 0
+
+            payoff = min(sy, sn) * 1.0
+            profit = payoff - (cost_yes + cost_no)
+
+            cur.execute("""
+                UPDATE sessions
+                SET end_ts=?, profit=?
+                WHERE id=?
+            """, (datetime.utcnow().isoformat(), profit, session_id))
+
             conn.commit()
             conn.close()
 
@@ -169,50 +192,47 @@ def bot_loop():
         prices = get_latest_prices()
         if prices:
             yes, no = prices
-            s = yes + no
-
             conn = db()
             cur = conn.cursor()
-            cur.execute("SELECT shares_filled FROM sessions WHERE id=?", (session_id,))
-            filled = cur.fetchone()[0]
 
-            if s < STATE.threshold and filled < STATE.shares:
-                remaining = STATE.shares - filled
+            cur.execute("SELECT shares_yes, shares_no FROM sessions WHERE id=?", (session_id,))
+            sy, sn = cur.fetchone()
 
+            # YES
+            if yes <= STATE.max_price and sy < STATE.shares:
+                buy = STATE.shares - sy
                 cur.execute("""
-                    INSERT INTO trades
-                    (session_id, ts, s_value, shares, price_yes, price_no)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (
-                    session_id,
-                    datetime.utcnow().isoformat(),
-                    s,
-                    remaining,
-                    yes,
-                    no
-                ))
+                    INSERT INTO trades (session_id, ts, side, price, shares)
+                    VALUES (?, ?, 'YES', ?, ?)
+                """, (session_id, datetime.utcnow().isoformat(), yes, buy))
+                cur.execute("UPDATE sessions SET shares_yes=shares_yes+? WHERE id=?",
+                            (buy, session_id))
+                STATE.status_msg = f"BUY YES {buy} @ {yes}"
 
+            # NO
+            if no <= STATE.max_price and sn < STATE.shares:
+                buy = STATE.shares - sn
                 cur.execute("""
-                    UPDATE sessions
-                    SET shares_filled = shares_filled + ?
-                    WHERE id=?
-                """, (remaining, session_id))
+                    INSERT INTO trades (session_id, ts, side, price, shares)
+                    VALUES (?, ?, 'NO', ?, ?)
+                """, (session_id, datetime.utcnow().isoformat(), no, buy))
+                cur.execute("UPDATE sessions SET shares_no=shares_no+? WHERE id=?",
+                            (buy, session_id))
+                STATE.status_msg = f"BUY NO {buy} @ {no}"
 
-                conn.commit()
-                conn.close()
-
-                STATE.status_msg = f"EXECUTOU {remaining} YES + {remaining} NO | s={round(s,4)}"
+            conn.commit()
+            conn.close()
 
         time.sleep(PRICE_POLL_SECONDS)
 
 # =========================
 # API
 # =========================
-app = FastAPI(title="BumbleBee v18")
+app = FastAPI(title="BumbleBee v19")
 
 class ControlReq(BaseModel):
     shares: Optional[int] = None
-    threshold: Optional[float] = None
+    max_price: Optional[float] = None
     mode: Optional[str] = None
     max_sessions: Optional[int] = None
 
@@ -231,26 +251,15 @@ def stop():
         STATE.status_msg = "BOT PARADO"
     return {"ok": True}
 
-@app.post("/reset")
-def reset():
-    with LOCK:
-        STATE.running = False
-        STATE.current_sessions = 0
-        STATE.status_msg = "RESET EXECUTADO"
-    return {"ok": True}
-
 @app.post("/controls")
 def controls(req: ControlReq):
     with LOCK:
-        if req.shares is not None:
-            STATE.shares = req.shares
-        if req.threshold is not None:
-            STATE.threshold = req.threshold
-        if req.mode is not None:
-            STATE.mode = req.mode
+        if req.shares is not None: STATE.shares = req.shares
+        if req.max_price is not None: STATE.max_price = req.max_price
+        if req.mode is not None: STATE.mode = req.mode
         if req.max_sessions is not None:
             STATE.max_sessions = req.max_sessions if req.max_sessions > 0 else None
-        STATE.status_msg = "CONFIGURAÇÕES ATUALIZADAS"
+        STATE.status_msg = "CONFIGURAÇÕES SALVAS"
     return {"ok": True}
 
 @app.get("/status")
@@ -262,83 +271,68 @@ def status():
 # =========================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM sessions ORDER BY id DESC LIMIT 5")
+    sessions = cur.fetchall()
+    cur.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 20")
+    trades = cur.fetchall()
+    conn.close()
+
     html = f"""
     <html>
     <head>
     <style>
-      body {{ background:#0f0f0f; color:#fff; font-family:Arial; padding:30px }}
-      input, select, button {{ padding:10px; font-size:15px; margin:5px }}
-      button {{ border:none; border-radius:6px; cursor:pointer }}
-      .on {{ background:#00c853 }}
-      .off {{ background:#d50000 }}
-      .glow {{ box-shadow:0 0 15px }}
+      body {{ background:#0f0f0f; color:white; font-family:Arial; padding:20px }}
       .box {{ border:2px solid gold; padding:15px; margin-top:15px }}
-      .hint {{ font-size:12px; color:#aaa }}
-      #visor {{ text-align:center; color:#ff4444; font-size:22px; margin-bottom:20px }}
+      table {{ width:100%; border-collapse:collapse; color:white }}
+      td,th {{ border:1px solid #555; padding:5px; font-size:13px }}
+      #visor {{ text-align:center; color:red; font-size:22px }}
+      .glow {{ box-shadow:0 0 12px }}
     </style>
     </head>
     <body>
 
-    <div id="visor">{STATE.status_msg}</div>
+    <div id="visor">🐝 BumbleBee v19 — {STATE.status_msg}</div>
 
     <div class="box">
-      <label>Shares</label>
-      <input id="shares" value="{STATE.shares}">
-      <div class="hint">Quantidade de shares por lado (YES + NO)</div>
-
-      <label>Threshold</label>
-      <input id="thr" value="{STATE.threshold}">
-      <div class="hint">Executa quando YES + NO &lt; threshold</div>
-
-      <label>Max Sessions</label>
-      <input id="maxs">
-      <div class="hint">Vazio = 24/7 | Número = limite de sessões</div>
-
-      <label>Modo</label>
-      <select id="mode">
-        <option value="paper">paper</option>
-        <option value="real">real</option>
-      </select>
-
+      Shares <input id="shares" value="{STATE.shares}">
+      Max Price <input id="mp" value="{STATE.max_price}">
+      Mode <select id="mode"><option>paper</option><option>real</option></select>
+      Max Sessions <input id="ms">
       <button onclick="save(this)">SALVAR</button>
+      <button onclick="startBot(this)">START</button>
+      <button onclick="stopBot(this)">STOP</button>
     </div>
 
     <div class="box">
-      <button class="on" onclick="startBot(this)">START</button>
-      <span class="hint">Inicia o bot</span><br>
+      <h3>Sessions</h3>
+      <table>
+        <tr><th>ID</th><th>YES</th><th>NO</th><th>Profit</th></tr>
+        {''.join(f"<tr><td>{s[0]}</td><td>{s[6]}</td><td>{s[7]}</td><td>{round(s[9],4)}</td></tr>" for s in sessions)}
+      </table>
+    </div>
 
-      <button class="off" onclick="stopBot(this)">STOP</button>
-      <span class="hint">Para o bot</span><br>
+    <div class="box">
+      <h3>Trades</h3>
+      <table>
+        <tr><th>Side</th><th>Price</th><th>Shares</th><th>Time</th></tr>
+        {''.join(f"<tr><td>{t[3]}</td><td>{t[4]}</td><td>{t[5]}</td><td>{t[2]}</td></tr>" for t in trades)}
+      </table>
+    </div>
 
-      <button onclick="resetBot(this)">RESET</button>
-      <span class="hint">Reseta estado interno</span>
+    <div class="box">
+      <a href="https://polymarket.com" target="_blank">Polymarket</a> |
+      <a href="https://kashi.io" target="_blank">Kashi</a>
     </div>
 
     <script>
-      function glow(btn,color){{
-        btn.classList.add('glow');
-        btn.style.boxShadow = '0 0 15px '+color;
-        setTimeout(()=>btn.classList.remove('glow'),800);
-      }}
-
-      async function save(btn){{
-        glow(btn,'#ffd700');
-        await fetch('/controls', {{
-          method:'POST',
-          headers:{{'Content-Type':'application/json'}},
-          body:JSON.stringify({{
-            shares:parseInt(shares.value),
-            threshold:parseFloat(thr.value),
-            max_sessions: maxs.value ? parseInt(maxs.value) : 0,
-            mode:mode.value
-          }})
-        }});
-        visor.innerText="CONFIGURAÇÕES SALVAS";
-      }}
-
-      async function startBot(btn){{ glow(btn,'#00ff00'); await fetch('/start',{{method:'POST'}}); visor.innerText="BOT INICIADO"; }}
-      async function stopBot(btn){{ glow(btn,'#ff0000'); await fetch('/stop',{{method:'POST'}}); visor.innerText="BOT PARADO"; }}
-      async function resetBot(btn){{ glow(btn,'#ffffff'); await fetch('/reset',{{method:'POST'}}); visor.innerText="RESET EXECUTADO"; }}
+      function glow(b){{b.classList.add('glow');setTimeout(()=>b.classList.remove('glow'),600);}}
+      async function save(b){{glow(b);await fetch('/controls',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+        body:JSON.stringify({{shares:parseInt(shares.value),max_price:parseFloat(mp.value),
+        mode:mode.value,max_sessions:ms.value?parseInt(ms.value):0}})}});}}
+      async function startBot(b){{glow(b);await fetch('/start',{{method:'POST'}});}}
+      async function stopBot(b){{glow(b);await fetch('/stop',{{method:'POST'}});}}
     </script>
 
     </body>
