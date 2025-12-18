@@ -8,6 +8,10 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
+# ======================================================
+# BUMBLEBEE v18
+# ======================================================
+
 # =========================
 # CONFIG
 # =========================
@@ -60,7 +64,7 @@ init_db()
 class BotState:
     running = False
     mode = "paper"
-    shares = 20            # POR LADO
+    shares = 20          # POR LADO
     threshold = 0.70
     status_msg = "idle"
 
@@ -166,7 +170,6 @@ def bot_loop():
             if s < STATE.threshold and filled < STATE.shares:
                 remaining = STATE.shares - filled
 
-                # EXECUTA SEMPRE NO MELHOR s DO MOMENTO
                 cur.execute("""
                     INSERT INTO trades
                     (session_id, ts, s_value, shares, price_yes, price_no)
@@ -196,37 +199,44 @@ def bot_loop():
 # =========================
 # API
 # =========================
-app = FastAPI(title="BumbleBee")
+app = FastAPI(title="BumbleBee v18")
 
 class ControlReq(BaseModel):
+    t2: Optional[float] = None   # mantido por compatibilidade do dashboard
+    t3: Optional[float] = None   # mantido por compatibilidade do dashboard
     shares: Optional[int] = None
-    threshold: Optional[float] = None
     mode: Optional[str] = None
+    max_sessions: Optional[int] = None
 
 @app.post("/start")
-def start():
+def start_bot():
     with LOCK:
         STATE.running = True
-        STATE.status_msg = "running"
+        STATE.status_msg = "bot iniciado"
     return {"ok": True}
 
 @app.post("/stop")
-def stop():
+def stop_bot():
     with LOCK:
         STATE.running = False
-        STATE.status_msg = "stopped"
+        STATE.status_msg = "bot parado"
+    return {"ok": True}
+
+@app.post("/reset")
+def reset_bot():
+    with LOCK:
+        STATE.running = False
+        STATE.status_msg = "estado resetado"
     return {"ok": True}
 
 @app.post("/controls")
-def controls(req: ControlReq):
+def update_controls(req: ControlReq):
     with LOCK:
         if req.shares is not None:
             STATE.shares = req.shares
-        if req.threshold is not None:
-            STATE.threshold = req.threshold
         if req.mode is not None:
             STATE.mode = req.mode
-        STATE.status_msg = "controls updated"
+        STATE.status_msg = "controles atualizados"
     return {"ok": True}
 
 @app.get("/status")
@@ -234,45 +244,82 @@ def status():
     return STATE.__dict__
 
 # =========================
-# DASHBOARD
+# DASHBOARD (COPIADO 1:1)
 # =========================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     html = f"""
     <html>
-    <body style="background:#0f0f0f;color:white;font-family:Arial;padding:30px">
-      <h1>BUMBLEBEE — STRUCTURAL BOT</h1>
+    <head>
+    <style>
+      body {{ background:#0f0f0f; color:#fff; font-family:Arial; padding:30px }}
+      input, select, button {{ padding:10px; font-size:15px; margin:5px }}
+      button {{ border:none; border-radius:6px; cursor:pointer }}
+      .on {{ background:#00c853 }}
+      .off {{ background:#d50000 }}
+      .box {{ border:2px solid gold; padding:15px; margin-top:15px }}
+      .hint {{ font-size:12px; color:#aaa }}
+    </style>
+    </head>
+    <body>
 
-      <div>
-        Shares por lado:
-        <input id="shares" value="{STATE.shares}">
-        <br>
-        Threshold (YES+NO):
-        <input id="thr" value="{STATE.threshold}">
-        <br><br>
-        <button onclick="save()">SALVAR</button>
-        <button onclick="start()">START</button>
-        <button onclick="stop()">STOP</button>
-      </div>
+    <h1>BUMBLEBEE — CONTROL DASH</h1>
 
-      <h3>Status</h3>
+    <div class="box">
+      <label>T2 (%)</label>
+      <input id="t2">
+      <div class="hint">Mantido por compatibilidade (não usado no v18)</div>
+
+      <label>T3 (%)</label>
+      <input id="t3">
+      <div class="hint">Mantido por compatibilidade (não usado no v18)</div>
+
+      <label>Shares</label>
+      <input id="shares" value="{STATE.shares}">
+      <div class="hint">Shares por lado (YES + NO)</div>
+
+      <label>Modo</label>
+      <select id="mode">
+        <option value="paper">paper</option>
+        <option value="real">real</option>
+      </select>
+
+      <button onclick="save()">SALVAR CONFIG</button>
+    </div>
+
+    <div class="box">
+      <button class="on" onclick="start()">START</button>
+      <span class="hint">Inicia o bot</span><br>
+
+      <button class="off" onclick="stop()">STOP</button>
+      <span class="hint">Para o bot</span><br>
+
+      <button onclick="reset()">RESET</button>
+      <span class="hint">Reseta estado</span>
+    </div>
+
+    <div class="box">
+      <h3>VISOR</h3>
       <p id="visor">{STATE.status_msg}</p>
+    </div>
 
-      <script>
-        async function save(){{
-          await fetch('/controls', {{
-            method:'POST',
-            headers:{{'Content-Type':'application/json'}},
-            body:JSON.stringify({{
-              shares:parseInt(shares.value),
-              threshold:parseFloat(thr.value)
-            }})
-          }});
-          visor.innerText="CONFIG SALVA";
-        }}
-        async function start(){{ await fetch('/start',{{method:'POST'}}); visor.innerText="RODANDO"; }}
-        async function stop(){{ await fetch('/stop',{{method:'POST'}}); visor.innerText="PARADO"; }}
-      </script>
+    <script>
+      async function save(){{
+        await fetch('/controls', {{
+          method:'POST',
+          headers:{{'Content-Type':'application/json'}},
+          body:JSON.stringify({{
+            shares:parseInt(shares.value),
+            mode:mode.value
+          }})
+        }});
+        visor.innerText="CONFIGURAÇÕES SALVAS";
+      }}
+      async function start(){{ await fetch('/start',{{method:'POST'}}); visor.innerText="BOT INICIADO"; }}
+      async function stop(){{ await fetch('/stop',{{method:'POST'}}); visor.innerText="BOT PARADO"; }}
+      async function reset(){{ await fetch('/reset',{{method:'POST'}}); visor.innerText="RESET EXECUTADO"; }}
+    </script>
+
     </body>
     </html>
     """
