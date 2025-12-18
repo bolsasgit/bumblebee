@@ -64,9 +64,11 @@ init_db()
 class BotState:
     running = False
     mode = "paper"
-    shares = 20          # POR LADO
+    shares = 20              # por lado
     threshold = 0.70
-    status_msg = "idle"
+    max_sessions = None      # None = 24/7
+    current_sessions = 0
+    status_msg = "IDLE"
 
 STATE = BotState()
 LOCK = threading.Lock()
@@ -153,6 +155,13 @@ def bot_loop():
             )
             conn.commit()
             conn.close()
+
+            with LOCK:
+                STATE.current_sessions += 1
+                if STATE.max_sessions and STATE.current_sessions >= STATE.max_sessions:
+                    STATE.running = False
+                    STATE.status_msg = "LIMITE DE SESSÕES ATINGIDO"
+
             session_id = None
             condition_id = None
             continue
@@ -192,7 +201,7 @@ def bot_loop():
                 conn.commit()
                 conn.close()
 
-                STATE.status_msg = f"EXECUTOU {remaining} YES + {remaining} NO @ s={round(s,4)}"
+                STATE.status_msg = f"EXECUTOU {remaining} YES + {remaining} NO | s={round(s,4)}"
 
         time.sleep(PRICE_POLL_SECONDS)
 
@@ -202,41 +211,46 @@ def bot_loop():
 app = FastAPI(title="BumbleBee v18")
 
 class ControlReq(BaseModel):
-    t2: Optional[float] = None   # mantido por compatibilidade do dashboard
-    t3: Optional[float] = None   # mantido por compatibilidade do dashboard
     shares: Optional[int] = None
+    threshold: Optional[float] = None
     mode: Optional[str] = None
     max_sessions: Optional[int] = None
 
 @app.post("/start")
-def start_bot():
+def start():
     with LOCK:
         STATE.running = True
-        STATE.status_msg = "bot iniciado"
+        STATE.current_sessions = 0
+        STATE.status_msg = "BOT INICIADO"
     return {"ok": True}
 
 @app.post("/stop")
-def stop_bot():
+def stop():
     with LOCK:
         STATE.running = False
-        STATE.status_msg = "bot parado"
+        STATE.status_msg = "BOT PARADO"
     return {"ok": True}
 
 @app.post("/reset")
-def reset_bot():
+def reset():
     with LOCK:
         STATE.running = False
-        STATE.status_msg = "estado resetado"
+        STATE.current_sessions = 0
+        STATE.status_msg = "RESET EXECUTADO"
     return {"ok": True}
 
 @app.post("/controls")
-def update_controls(req: ControlReq):
+def controls(req: ControlReq):
     with LOCK:
         if req.shares is not None:
             STATE.shares = req.shares
+        if req.threshold is not None:
+            STATE.threshold = req.threshold
         if req.mode is not None:
             STATE.mode = req.mode
-        STATE.status_msg = "controles atualizados"
+        if req.max_sessions is not None:
+            STATE.max_sessions = req.max_sessions if req.max_sessions > 0 else None
+        STATE.status_msg = "CONFIGURAÇÕES ATUALIZADAS"
     return {"ok": True}
 
 @app.get("/status")
@@ -244,7 +258,7 @@ def status():
     return STATE.__dict__
 
 # =========================
-# DASHBOARD (COPIADO 1:1)
+# DASHBOARD
 # =========================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -257,26 +271,28 @@ def dashboard():
       button {{ border:none; border-radius:6px; cursor:pointer }}
       .on {{ background:#00c853 }}
       .off {{ background:#d50000 }}
+      .glow {{ box-shadow:0 0 15px }}
       .box {{ border:2px solid gold; padding:15px; margin-top:15px }}
       .hint {{ font-size:12px; color:#aaa }}
+      #visor {{ text-align:center; color:#ff4444; font-size:22px; margin-bottom:20px }}
     </style>
     </head>
     <body>
 
-    <h1>BUMBLEBEE — CONTROL DASH</h1>
+    <div id="visor">{STATE.status_msg}</div>
 
     <div class="box">
-      <label>T2 (%)</label>
-      <input id="t2">
-      <div class="hint">Mantido por compatibilidade (não usado no v18)</div>
-
-      <label>T3 (%)</label>
-      <input id="t3">
-      <div class="hint">Mantido por compatibilidade (não usado no v18)</div>
-
       <label>Shares</label>
       <input id="shares" value="{STATE.shares}">
-      <div class="hint">Shares por lado (YES + NO)</div>
+      <div class="hint">Quantidade de shares por lado (YES + NO)</div>
+
+      <label>Threshold</label>
+      <input id="thr" value="{STATE.threshold}">
+      <div class="hint">Executa quando YES + NO &lt; threshold</div>
+
+      <label>Max Sessions</label>
+      <input id="maxs">
+      <div class="hint">Vazio = 24/7 | Número = limite de sessões</div>
 
       <label>Modo</label>
       <select id="mode">
@@ -284,40 +300,45 @@ def dashboard():
         <option value="real">real</option>
       </select>
 
-      <button onclick="save()">SALVAR CONFIG</button>
+      <button onclick="save(this)">SALVAR</button>
     </div>
 
     <div class="box">
-      <button class="on" onclick="start()">START</button>
+      <button class="on" onclick="startBot(this)">START</button>
       <span class="hint">Inicia o bot</span><br>
 
-      <button class="off" onclick="stop()">STOP</button>
+      <button class="off" onclick="stopBot(this)">STOP</button>
       <span class="hint">Para o bot</span><br>
 
-      <button onclick="reset()">RESET</button>
-      <span class="hint">Reseta estado</span>
-    </div>
-
-    <div class="box">
-      <h3>VISOR</h3>
-      <p id="visor">{STATE.status_msg}</p>
+      <button onclick="resetBot(this)">RESET</button>
+      <span class="hint">Reseta estado interno</span>
     </div>
 
     <script>
-      async function save(){{
+      function glow(btn,color){{
+        btn.classList.add('glow');
+        btn.style.boxShadow = '0 0 15px '+color;
+        setTimeout(()=>btn.classList.remove('glow'),800);
+      }}
+
+      async function save(btn){{
+        glow(btn,'#ffd700');
         await fetch('/controls', {{
           method:'POST',
           headers:{{'Content-Type':'application/json'}},
           body:JSON.stringify({{
             shares:parseInt(shares.value),
+            threshold:parseFloat(thr.value),
+            max_sessions: maxs.value ? parseInt(maxs.value) : 0,
             mode:mode.value
           }})
         }});
         visor.innerText="CONFIGURAÇÕES SALVAS";
       }}
-      async function start(){{ await fetch('/start',{{method:'POST'}}); visor.innerText="BOT INICIADO"; }}
-      async function stop(){{ await fetch('/stop',{{method:'POST'}}); visor.innerText="BOT PARADO"; }}
-      async function reset(){{ await fetch('/reset',{{method:'POST'}}); visor.innerText="RESET EXECUTADO"; }}
+
+      async function startBot(btn){{ glow(btn,'#00ff00'); await fetch('/start',{{method:'POST'}}); visor.innerText="BOT INICIADO"; }}
+      async function stopBot(btn){{ glow(btn,'#ff0000'); await fetch('/stop',{{method:'POST'}}); visor.innerText="BOT PARADO"; }}
+      async function resetBot(btn){{ glow(btn,'#ffffff'); await fetch('/reset',{{method:'POST'}}); visor.innerText="RESET EXECUTADO"; }}
     </script>
 
     </body>
