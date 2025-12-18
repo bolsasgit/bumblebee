@@ -15,10 +15,7 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 
 DB_NAME = "polymarket.db"
-
 PRICE_POLL_SECONDS = 5
-T2_THRESHOLD = 0.85
-
 MODE = "paper"
 
 # =========================
@@ -30,7 +27,6 @@ def db():
 def init_db():
     conn = db()
     cur = conn.cursor()
-
     cur.executescript("""
     CREATE TABLE IF NOT EXISTS sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,8 +35,7 @@ def init_db():
         start_ts TEXT,
         end_ts TEXT,
         mode TEXT,
-        wallet_id TEXT,
-        final_pnl REAL DEFAULT 0
+        wallet_id TEXT
     );
 
     CREATE TABLE IF NOT EXISTS price_snapshots (
@@ -52,7 +47,6 @@ def init_db():
         price_no REAL
     );
     """)
-
     conn.commit()
     conn.close()
 
@@ -65,10 +59,10 @@ class BotState:
     def __init__(self):
         self.running = False
         self.mode = MODE
-        self.max_sessions: Optional[int] = None
+        self.max_sessions = 1
         self.current_sessions = 0
-        self.wallet_id: Optional[str] = None
-        self.status_msg = "stopped"
+        self.wallet_id = "pt"
+        self.status_msg = "idle"
 
 STATE = BotState()
 LOCK = threading.Lock()
@@ -82,8 +76,6 @@ def get_active_btc_15m_market():
         params={"active": True, "closed": False, "limit": 50},
         timeout=10
     )
-    resp.raise_for_status()
-
     for m in resp.json():
         q = (m.get("question") or "").lower()
         if "btc" in q and "15" in q:
@@ -92,18 +84,16 @@ def get_active_btc_15m_market():
 
 def get_latest_yes_no_prices():
     resp = requests.get(f"{DATA_API}/trades", params={"limit": 50}, timeout=10)
-    resp.raise_for_status()
-
     yes, no = None, None
     for t in resp.json():
         side = (t.get("outcome") or "").upper()
         price = float(t.get("price"))
         if side == "YES":
             yes = price
-        elif side == "NO":
+        if side == "NO":
             no = price
         if yes is not None and no is not None:
-            return {"YES": yes, "NO": no}
+            return yes, no
     return None
 
 # =========================
@@ -125,8 +115,9 @@ def bot_loop():
                 time.sleep(5)
                 continue
 
-            end_raw = market.get("endDate")
-            session_end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+            session_end_dt = datetime.fromisoformat(
+                market["endDate"].replace("Z", "+00:00")
+            )
 
             conn = db()
             cur = conn.cursor()
@@ -144,28 +135,22 @@ def bot_loop():
             conn.commit()
             conn.close()
 
-        now = datetime.now(timezone.utc)
-        seconds_left = int((session_end_dt - now).total_seconds())
+        seconds_left = int((session_end_dt - datetime.now(timezone.utc)).total_seconds())
 
         if seconds_left <= 0:
             conn = db()
             cur = conn.cursor()
-            cur.execute(
-                "UPDATE sessions SET end_ts=? WHERE id=?",
-                (datetime.utcnow().isoformat(), session_id)
-            )
+            cur.execute("UPDATE sessions SET end_ts=? WHERE id=?",
+                        (datetime.utcnow().isoformat(), session_id))
             conn.commit()
             conn.close()
 
             session_id = None
-            session_end_dt = None
-
             with LOCK:
                 STATE.current_sessions += 1
-                if STATE.max_sessions and STATE.current_sessions >= STATE.max_sessions:
+                if STATE.current_sessions >= STATE.max_sessions:
                     STATE.running = False
                     STATE.status_msg = "completed"
-                    break
             continue
 
         prices = get_latest_yes_no_prices()
@@ -173,15 +158,15 @@ def bot_loop():
             conn = db()
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO price_snapshots (
-                    session_id, ts, seconds_to_expiry, price_yes, price_no
-                ) VALUES (?, ?, ?, ?, ?)
+                INSERT INTO price_snapshots
+                (session_id, ts, seconds_to_expiry, price_yes, price_no)
+                VALUES (?, ?, ?, ?, ?)
             """, (
                 session_id,
                 datetime.utcnow().isoformat(),
                 seconds_left,
-                prices["YES"],
-                prices["NO"]
+                prices[0],
+                prices[1]
             ))
             conn.commit()
             conn.close()
@@ -191,22 +176,14 @@ def bot_loop():
 # =========================
 # API
 # =========================
-app = FastAPI(title="BumbleBee Bot")
-
-class StartRequest(BaseModel):
-    mode: str
-    sessions: int
-    wallet_id: Optional[str] = None
+app = FastAPI(title="BumbleBee")
 
 @app.post("/start")
-def start_bot(req: StartRequest):
+def start_bot():
     with LOCK:
-        STATE.mode = req.mode
-        STATE.max_sessions = req.sessions
-        STATE.wallet_id = req.wallet_id
-        STATE.current_sessions = 0
         STATE.running = True
-        STATE.status_msg = "running"
+        STATE.current_sessions = 0
+        STATE.status_msg = "started"
     return {"ok": True}
 
 @app.post("/stop")
@@ -218,86 +195,55 @@ def stop_bot():
 
 @app.get("/status")
 def status():
-    return {
-        "running": STATE.running,
-        "mode": STATE.mode,
-        "max_sessions": STATE.max_sessions,
-        "current_sessions": STATE.current_sessions,
-        "wallet_id": STATE.wallet_id,
-        "status_msg": STATE.status_msg,
-        "timestamp": time.time()
-    }
+    return STATE.__dict__
 
 # =========================
-# DASHBOARD HUMANO
+# DASHBOARD
 # =========================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute("SELECT COUNT(*) FROM sessions")
-    total_sessions = cur.fetchone()[0]
-
-    cur.execute("SELECT COUNT(*) FROM sessions WHERE end_ts IS NULL")
-    active_sessions = cur.fetchone()[0]
-
-    cur.execute("SELECT COUNT(*) FROM price_snapshots")
-    snapshots = cur.fetchone()[0]
-
-    conn.close()
-
-    bot_status = "RODANDO" if STATE.running else "PARADO"
-    modo = "SIMULACAO" if STATE.mode == "paper" else "REAL"
-
     html = f"""
     <html>
     <head>
-        <title>BUMBLEBEE</title>
-        <style>
-            body {{
-                background-color: #0f0f0f;
-                color: #ffffff;
-                font-family: Arial, sans-serif;
-                padding: 30px;
-            }}
-            .box {{
-                border: 2px solid #ffd700;
-                padding: 20px;
-                margin-bottom: 20px;
-            }}
-            h1, h2 {{
-                color: #ffd700;
-            }}
-            p {{
-                font-size: 20px;
-                margin: 6px 0;
-            }}
-        </style>
+    <style>
+        body {{ background:#0f0f0f; color:white; font-family:Arial; padding:30px }}
+        button {{
+            padding:15px; font-size:18px; margin:5px;
+            border-radius:8px; border:none; cursor:pointer;
+        }}
+        .start {{ background:#1e90ff }}
+        .stop {{ background:#ff4444 }}
+        .active {{ box-shadow:0 0 10px #00ff00 }}
+        .panel {{ border:2px solid gold; padding:15px; margin-top:20px }}
+    </style>
     </head>
     <body>
 
-        <h1>BUMBLEBEE — PAPER TRADE</h1>
+    <h1>BUMBLEBEE — CONTROL DASH</h1>
 
-        <div class="box">
-            <h2>STATUS GERAL</h2>
-            <p>BOT: {bot_status}</p>
-            <p>MODO: {modo}</p>
-            <p>SESSOES ATIVAS: {active_sessions}</p>
-            <p>SESSOES CONCLUIDAS: {total_sessions - active_sessions}</p>
-        </div>
+    <button id="start" class="start" onclick="start()">START BOT</button>
+    <button id="stop" class="stop" onclick="stop()">STOP BOT</button>
 
-        <div class="box">
-            <h2>ATIVIDADE</h2>
-            <p>COLETAS DE PRECO: {snapshots}</p>
-            <p>ROUND EM ANDAMENTO: {"SIM" if STATE.running else "NAO"}</p>
-        </div>
+    <div class="panel">
+        <h2>STATUS</h2>
+        <p id="visor">Idle</p>
+    </div>
 
-        <div class="box">
-            <h2>AVALIACAO</h2>
-            <p>EDGE: EM ANALISE</p>
-            <p>CONSISTENCIA: AGUARDANDO DADOS</p>
-        </div>
+    <script>
+    async function start() {{
+        await fetch('/start', {{method:'POST'}});
+        document.getElementById('start').classList.add('active');
+        document.getElementById('stop').classList.remove('active');
+        document.getElementById('visor').innerText = "BOT STARTED";
+    }}
+
+    async function stop() {{
+        await fetch('/stop', {{method:'POST'}});
+        document.getElementById('stop').classList.add('active');
+        document.getElementById('start').classList.remove('active');
+        document.getElementById('visor').innerText = "BOT STOPPED";
+    }}
+    </script>
 
     </body>
     </html>
